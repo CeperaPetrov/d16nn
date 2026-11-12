@@ -63,7 +63,7 @@ class D16QwenConfig:
     mlp_bias: bool = False
 
     # D16Complex specific parameters
-    mlp_mode: str = "d16_swiglu"  # "d16_swiglu" (1-to-1 Qwen) or "d16_bipolar" (native Re/Im z^2)
+    mlp_mode: str = "d16_bipolar"  # "d16_swiglu" (1-to-1 Qwen) or "d16_bipolar" (native Re/Im z^2)
     indiff_eps: float = 0.0       # Threshold for transitioning weak signals to 0xFFFF (State 16: Indifferent)
     collect_d16_stats: bool = False
 
@@ -80,7 +80,7 @@ class D16QwenConfig:
         num_hidden_layers: int = 2,
         num_attention_heads: int = 4,
         num_key_value_heads: int = 2,
-        mlp_mode: str = "d16_swiglu",
+        mlp_mode: str = "d16_bipolar",
         indiff_eps: float = 0.0,
     ) -> "D16QwenConfig":
         """Compact configuration for fast unit tests and training from scratch."""
