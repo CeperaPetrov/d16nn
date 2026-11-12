@@ -1,23 +1,20 @@
-"""Standalone D16Qwen Transformer Architecture built on D16ComplexTensor.
+"""Standalone D16Qwen Transformer Architecture built purely on D16ComplexTensor.
 
-This module implements the complete Qwen2.5-compatible Causal Language Model
+This module implements the complete D16Qwen Causal Language Model
 (D16QwenConfig, D16RMSNorm, D16RotaryEmbedding, D16QwenAttention, D16QwenMLP,
 D16QwenDecoderLayer, D16QwenModel, D16QwenForCausalLM) from scratch in pure
-PyTorch using D16ComplexTensor from d16_complex.py, with zero dependency on
-external model libraries.
+PyTorch using D16ComplexTensor from d16_complex.py.
 
-Key architectural features:
-1. RoPE in D16QwenAttention is computed as complex multiplication inside the
+Key architectural principles:
+1. RoPE in D16QwenAttention is executed as complex multiplication inside the
    [0°, 22.5°] fundamental wedge: z_rot = z_qk * z_freq via D16ComplexTensor.
-2. Non-linearity in D16QwenMLP operates explicitly on D16ComplexTensor objects
-   (z = D16ComplexTensor.from_xy(L, E), z2 = z.square() inside [0°, 22.5°]),
-   supporting both:
-   - "d16_swiglu": 1-to-1 Qwen2.5 compatible mode (0.5 * Im(z^2) * sigmoid(Im(z)))
-   - "d16_bipolar": compact native complex mode outputting both (Re(z^2), Im(z^2))
-     with 18-state sector gains.
-3. Full Straight-Through Estimator (STE) autograd bridge so the network can be
-   trained from scratch with standard optimizers while executing exact D16Complex
-   wedge arithmetic on the forward pass.
+2. D16QwenMLP is 100% native D16Complex: each neuron encodes (L, E) into
+   z = D16ComplexTensor.from_xy(L, E), computes the complex square z2 = z.square()
+   inside the [0°, 22.5°] wedge, modulates (Re(z^2), Im(z^2)) by learnable 18-state
+   sector profiles (sector_re_gain, sector_im_gain), and projects back via
+   (down_re_proj, down_im_proj).
+3. Straight-Through Estimator (STE) autograd bridge enables training from scratch
+   with standard optimizers while forward passes use exact D16Complex arithmetic.
 """
 from __future__ import annotations
 
@@ -33,25 +30,24 @@ from d16_complex import (
     D16ComplexTensor,
     MASK_NAN,
     MASK_ZERO,
-    STATE_INDIFFERENT,
     apply_group_op_u16,
-    rol_u16,
     reverse_bits_u16,
+    rol_u16,
     state_u16,
 )
 
 
 # =====================================================================
-# 1. CONFIGURATION (QWEN2.5 COMPATIBLE + D16 EXTENSIONS)
+# 1. CONFIGURATION
 # =====================================================================
 
 @dataclass
 class D16QwenConfig:
-    """Configuration class for D16QwenModel and D16QwenForCausalLM."""
+    """Configuration class for the native D16QwenModel and D16QwenForCausalLM."""
 
     vocab_size: int = 151936
     hidden_size: int = 896
-    intermediate_size: int = 4864
+    intermediate_size: int = 1216  # 4864 real Qwen channels = 1216 native D16Complex units
     num_hidden_layers: int = 24
     num_attention_heads: int = 14
     num_key_value_heads: int = 2
@@ -62,9 +58,8 @@ class D16QwenConfig:
     attention_bias: bool = True
     mlp_bias: bool = False
 
-    # D16Complex specific parameters
-    mlp_mode: str = "d16_bipolar"  # "d16_swiglu" (1-to-1 Qwen) or "d16_bipolar" (native Re/Im z^2)
-    indiff_eps: float = 0.0       # Threshold for transitioning weak signals to 0xFFFF (State 16: Indifferent)
+    # D16Complex runtime parameters
+    indiff_eps: float = 0.0
     collect_d16_stats: bool = False
 
     @property
@@ -76,11 +71,10 @@ class D16QwenConfig:
         cls,
         vocab_size: int = 256,
         hidden_size: int = 64,
-        intermediate_size: int = 128,
+        intermediate_size: int = 64,
         num_hidden_layers: int = 2,
         num_attention_heads: int = 4,
         num_key_value_heads: int = 2,
-        mlp_mode: str = "d16_bipolar",
         indiff_eps: float = 0.0,
     ) -> "D16QwenConfig":
         """Compact configuration for fast unit tests and training from scratch."""
@@ -97,7 +91,6 @@ class D16QwenConfig:
             tie_word_embeddings=True,
             attention_bias=True,
             mlp_bias=False,
-            mlp_mode=mlp_mode,
             indiff_eps=indiff_eps,
         )
 
@@ -113,13 +106,12 @@ def d16_complex_square_ste(
     steer_mode: str = "identity",
     steer_shift: int = 0,
     steer_channels: Optional[torch.Tensor] = None,
-) -> Tuple[D16ComplexTensor, D16ComplexTensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[D16ComplexTensor, D16ComplexTensor, torch.Tensor, torch.Tensor]:
     """Compute z and z^2 = z * z in the [0°, 22.5°] wedge with STE autograd support.
 
-    On the forward pass, values are computed strictly through D16ComplexTensor
-    inside the [0°, 22.5°] fundamental wedge (including 0xFFFF Indifferent gating
-    and optional pure-mask steering). On the backward pass (when training),
-    gradients flow smoothly through the exact algebraic identities.
+    Forward pass executes strictly through D16ComplexTensor inside the [0°, 22.5°]
+    fundamental wedge. Backward pass propagates gradients through the exact quadratic
+    identities on active (non-0xFFFF) states.
     """
     with torch.no_grad():
         z = D16ComplexTensor.from_xy(logic.detach(), emotion.detach(), eps=indiff_eps)
@@ -129,25 +121,20 @@ def d16_complex_square_ste(
 
         z2 = z.square()
         re_z2_d16, im_z2_d16 = z2.to_xy()
-        _, im_z_d16 = z.to_xy()
-
         re_z2_d16 = torch.nan_to_num(re_z2_d16, 0.0).to(logic.dtype)
         im_z2_d16 = torch.nan_to_num(im_z2_d16, 0.0).to(logic.dtype)
-        im_z_d16 = torch.nan_to_num(im_z_d16, 0.0).to(logic.dtype)
 
     if (logic.requires_grad or emotion.requires_grad) and steer_mode == "identity":
         active_mask = (~z.is_zero()).to(logic.dtype)
         re_cont = (logic.square() - emotion.square()) * active_mask
         im_cont = (2.0 * logic * emotion) * active_mask
-        e_cont = emotion * active_mask
 
         re_z2 = re_cont + (re_z2_d16 - re_cont).detach()
         im_z2 = im_cont + (im_z2_d16 - im_cont).detach()
-        im_z = e_cont + (im_z_d16 - e_cont).detach()
     else:
-        re_z2, im_z2, im_z = re_z2_d16, im_z2_d16, im_z_d16
+        re_z2, im_z2 = re_z2_d16, im_z2_d16
 
-    return z, z2, re_z2, im_z2, im_z
+    return z, z2, re_z2, im_z2
 
 
 def _apply_sector_steering(
@@ -158,10 +145,7 @@ def _apply_sector_steering(
 ) -> D16ComplexTensor:
     """Modify only the 16-bit sector mask while keeping (x, y) in [0°, 22.5°] untouched."""
     rot = z.rotation.clone()
-    if channels is not None:
-        target = rot[..., -1, channels]
-    else:
-        target = rot
+    target = rot[..., -1, channels] if channels is not None else rot
 
     s = state_u16(target)
     special = (target == MASK_ZERO) | (target == MASK_NAN)
@@ -203,7 +187,7 @@ def _apply_sector_steering(
 # =====================================================================
 
 class D16RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization (Qwen2.5 compatible)."""
+    """Root Mean Square Layer Normalization."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -219,12 +203,7 @@ class D16RMSNorm(nn.Module):
 
 
 class D16RotaryEmbedding(nn.Module):
-    """Rotary Position Embedding (RoPE) executed via D16ComplexTensor multiplication.
-
-    Each pair of coordinates (x_m, x_{m + D/2}) in a query or key head is encoded
-    as a D16ComplexTensor and multiplied by the unit rotary phase D16ComplexTensor
-    inside the [0°, 22.5°] fundamental wedge.
-    """
+    """Rotary Position Embedding (RoPE) executed via D16ComplexTensor multiplication."""
 
     def __init__(self, head_dim: int, max_position_embeddings: int = 32768, base: float = 1000000.0) -> None:
         super().__init__()
@@ -244,11 +223,10 @@ class D16RotaryEmbedding(nn.Module):
         x: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # position_ids: [batch, seq_len]
         calc_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
         inv_freq_expanded = self.inv_freq[None, :, None].to(calc_dtype).expand(position_ids.shape[0], -1, 1)
         pos_expanded = position_ids[:, None, :].to(calc_dtype)
-        freqs = (inv_freq_expanded @ pos_expanded).transpose(1, 2)  # [batch, seq_len, head_dim // 2]
+        freqs = (inv_freq_expanded @ pos_expanded).transpose(1, 2)
         cos = freqs.cos().to(dtype=x.dtype)
         sin = freqs.sin().to(dtype=x.dtype)
         return cos, sin
@@ -261,8 +239,6 @@ class D16RotaryEmbedding(nn.Module):
         sin: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Rotate Q and K heads via D16ComplexTensor multiplication in [0°, 22.5°]."""
-        # q, k shape: [batch, num_heads, seq_len, head_dim]
-        # cos, sin shape: [batch, seq_len, head_dim // 2] -> broadcast over heads
         cos_b = cos.unsqueeze(1)
         sin_b = sin.unsqueeze(1)
 
@@ -280,7 +256,6 @@ class D16RotaryEmbedding(nn.Module):
                 out_im_d16 = torch.nan_to_num(out_im_d16, 0.0).to(t.dtype)
 
             if t.requires_grad:
-                # Differentiable STE path for training
                 out_re_cont = t_re * cos_b - t_im * sin_b
                 out_im_cont = t_re * sin_b + t_im * cos_b
                 out_re = out_re_cont + (out_re_d16 - out_re_cont).detach()
@@ -366,18 +341,19 @@ class D16QwenAttention(nn.Module):
 
 
 # =====================================================================
-# 5. D16Complex MLP BLOCK (D16QwenMLP)
+# 5. NATIVE D16Complex MLP BLOCK (D16QwenMLP)
 # =====================================================================
 
 class D16QwenMLP(nn.Module):
-    """MLP layer built explicitly on D16ComplexTensor objects.
+    """Native MLP layer built exclusively on D16ComplexTensor objects.
 
-    Supports two operating modes configured via config.mlp_mode:
-    - "d16_swiglu": 1-to-1 Qwen2.5 compatible mode where each neuron encodes
-      (up_proj(x), gate_proj(x)) -> z in D16ComplexTensor, computes z2 = z.square()
-      in the [0°, 22.5°] wedge, and outputs 0.5 * Im(z2) * sigmoid(Im(z)).
-    - "d16_bipolar": Native compact complex mode where each D16Complex neuron
-      outputs both Re(z^2) and Im(z^2) weighted by an 18-state sector profile.
+    Each of the K = intermediate_size complex units:
+    1. Projects input x into complex plane (L, E) = (up_proj(x), gate_proj(x)).
+    2. Encodes (L, E) into the [0°, 22.5°] fundamental wedge: z = D16ComplexTensor.from_xy(L, E).
+    3. Computes the exact complex square inside the wedge: z2 = z.square() -> (Re(z^2), Im(z^2)).
+    4. Modulates Re(z^2) and Im(z^2) by the neuron's 18-state sector profile
+       (sector_re_gain[k, s], sector_im_gain[k, s], where s = z.state() in 0..17).
+    5. Projects both components back into the residual stream via down_re_proj and down_im_proj.
     """
 
     def __init__(self, config: D16QwenConfig, layer_idx: int = 0) -> None:
@@ -386,20 +362,25 @@ class D16QwenMLP(nn.Module):
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.mlp_mode = config.mlp_mode
         self.indiff_eps = config.indiff_eps
         self.collect_stats = config.collect_d16_stats
 
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
+        # Complex plane input projections (L = Re(z), E = Im(z))
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
 
-        if self.mlp_mode == "d16_bipolar":
-            self.down_im_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-            self.sector_gain = nn.Parameter(torch.ones(self.intermediate_size, 18))
-        else:
-            self.register_parameter("down_im_proj", None)
-            self.register_parameter("sector_gain", None)
+        # 18-state sector modulation tables for Re(z^2) and Im(z^2)
+        # States 0..7 (upper half-plane) initialized to 1.0, 8..15 (lower half-plane) to 0.25,
+        # States 16 (Indifferent) and 17 (Undefined) initialized to 0.0.
+        init_gain = torch.ones(self.intermediate_size, 18)
+        init_gain[:, 8:16] = 0.25
+        init_gain[:, 16:] = 0.0
+        self.sector_re_gain = nn.Parameter(init_gain.clone())
+        self.sector_im_gain = nn.Parameter(init_gain.clone())
+
+        # Dual output projections for Re(z^2) and Im(z^2)
+        self.down_re_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.down_im_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
         # Runtime steering and telemetry attributes
         self.steer_mode: str = "identity"
@@ -418,7 +399,7 @@ class D16QwenMLP(nn.Module):
         logic = self.up_proj(x)
         emotion = self.gate_proj(x)
 
-        z, _z2, re_z2, im_z2, im_z = d16_complex_square_ste(
+        z, _z2, re_z2, im_z2 = d16_complex_square_ste(
             logic,
             emotion,
             indiff_eps=self.indiff_eps,
@@ -427,29 +408,31 @@ class D16QwenMLP(nn.Module):
             steer_channels=self.steer_channels,
         )
 
+        s_idx = z.state()  # [..., K] in 0..17
+
         if self.collect_stats:
             with torch.no_grad():
-                st = z.state().flatten()
+                st = s_idx.flatten()
                 self.state_counts += torch.bincount(st.cpu(), minlength=18).to(self.state_counts.device)
                 self.total_elements += int(z.rotation.numel())
                 self.indifferent_elements += int((z.rotation == MASK_ZERO).sum())
 
-        if self.mlp_mode == "d16_swiglu":
-            # 0.5 * Im(z^2) * sigmoid(Im(z)) == L * SiLU(E) computed via [0°, 22.5°] wedge square
-            act = 0.5 * im_z2 * torch.sigmoid(im_z)
-            return self.down_proj(act)
+        # Gather 18-state sector gains for each neuron's current sector s_idx
+        flat_s = s_idx.reshape(-1, self.intermediate_size).unsqueeze(-1)
+        batch_items = flat_s.shape[0]
 
-        if self.mlp_mode == "d16_bipolar":
-            s_idx = z.state()  # [..., K] in 0..17
-            flat_s = s_idx.reshape(-1, self.intermediate_size)
-            gain = torch.gather(
-                self.sector_gain.unsqueeze(0).expand(flat_s.shape[0], -1, -1),
-                dim=-1,
-                index=flat_s.unsqueeze(-1),
-            ).squeeze(-1).view_as(re_z2)
-            return self.down_proj(re_z2 * gain) + self.down_im_proj(im_z2 * gain)
+        re_table = self.sector_re_gain.to(x.dtype).unsqueeze(0).expand(batch_items, -1, -1)
+        im_table = self.sector_im_gain.to(x.dtype).unsqueeze(0).expand(batch_items, -1, -1)
 
-        raise ValueError(f"Unsupported mlp_mode: {self.mlp_mode}")
+        g_re = torch.gather(re_table, dim=-1, index=flat_s).squeeze(-1).view_as(re_z2)
+        g_im = torch.gather(im_table, dim=-1, index=flat_s).squeeze(-1).view_as(im_z2)
+
+        # States 16 (0xFFFF: Indifferent) and 17 (0x0000: Undefined) are strictly zeroed
+        active = (s_idx < 16).to(x.dtype)
+        act_re = re_z2 * g_re * active
+        act_im = 0.5 * im_z2 * g_im * active
+
+        return self.down_re_proj(act_re) + self.down_im_proj(act_im)
 
 
 # =====================================================================
@@ -531,14 +514,15 @@ class D16QwenModel(nn.Module):
         bsz, seq_len = input_ids.shape
         total_len = past_length + seq_len
         device = input_ids.device
+        min_val = torch.finfo(dtype).min
 
-        causal = torch.full((seq_len, total_len), float("-inf"), dtype=dtype, device=device)
+        causal = torch.full((seq_len, total_len), min_val, dtype=dtype, device=device)
         causal = torch.triu(causal, diagonal=past_length + 1)
-        causal = causal.unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len, total_len)
+        causal = causal.unsqueeze(0).unsqueeze(1).expand(bsz, 1, seq_len, total_len).clone()
 
         if attention_mask is not None and attention_mask.shape[-1] == total_len:
-            pad_mask = (1.0 - attention_mask[:, None, None, :].to(dtype)) * float("-inf")
-            causal = causal + pad_mask
+            key_is_pad = (attention_mask[:, None, None, :] == 0)
+            causal = causal.masked_fill(key_is_pad, min_val)
 
         return causal
 
@@ -583,7 +567,7 @@ class D16QwenModel(nn.Module):
 
 
 class D16QwenForCausalLM(nn.Module):
-    """Standalone D16Qwen Causal Language Model with training, generation, and D16 telemetry."""
+    """Standalone D16Qwen Causal Language Model."""
 
     def __init__(self, config: D16QwenConfig) -> None:
         super().__init__()
