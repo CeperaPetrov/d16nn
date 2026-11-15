@@ -1,4 +1,4 @@
-"""Unit tests for d16_qwen_converter.py (Z_8 |>< Z_2 orbit discovery and weight conversion).
+"""Unit tests for d16_qwen_converter.py (1-to-1 D16Complex conversion and Z_8 |>< Z_2 orbit discovery).
 
 Can be executed via:
     python tests/test_d16_qwen_converter.py
@@ -37,7 +37,7 @@ from d16_qwen_model import D16QwenConfig, D16QwenMLP
 
 
 class TestD16GroupMatricesAndOrbitDiscovery(unittest.TestCase):
-    """Проверка 16 матриц группы Z_8 |>< Z_2 и точного обнаружения искусственно заложенных орбит."""
+    """Проверка 16 матриц группы Z_8 |>< Z_2, сохранения всех N объектов D16Complex и поиска орбит."""
 
     def test_group_matrices_orthogonality_and_quadratic_identities(self) -> None:
         mats = d16_group_matrices(dtype=torch.float64)
@@ -52,22 +52,21 @@ class TestD16GroupMatricesAndOrbitDiscovery(unittest.TestCase):
 
         for op in range(16):
             M = mats[op]
-            self.assertLess(float((M.T @ M - eye).abs().max()), 1e-14)
+            self.assertLess(float((M.T @ M - eye).abs().max().item()), 1e-14)
             u_p, g_p = M @ vec
             prod = float((u_p * g_p).item())
             expected = OP_QUAD_SIGN[op] * (im_half if op < 8 else re_half)
             self.assertAlmostEqual(prod, float(expected.item()), places=13)
 
-    def test_synthetic_orbit_recovery_and_4to1_layer_conversion(self) -> None:
+    def test_synthetic_orbit_discovery_and_exact_layer_preservation(self) -> None:
         torch.manual_seed(7)
         hidden_size = 32
         K_true = 6
-        N = K_true * 4  # 24 вещественных нейрона, собранных из 6 истинных орбит D16Complex
+        N = K_true * 4  # 24 независимых объекта D16Complex, лежащих на 6 орбитах по 4 точки
 
         mats = d16_group_matrices(dtype=torch.float32)
         base_B = F.normalize(torch.randn(K_true, 2, hidden_size), dim=-1) * 1.5
 
-        # Задаем в каждой четверке: якорь (op=0), антипод (op=1), и два 45°-партнера Адамара (op=8, 9)
         planted_ops = torch.tensor([[0, 1, 8, 9]] * K_true, dtype=torch.long)
         U_list, G_list = [], []
         for q in range(K_true):
@@ -81,22 +80,20 @@ class TestD16GroupMatricesAndOrbitDiscovery(unittest.TestCase):
         G_real = torch.stack(G_list, dim=0)  # [24, 32]
         D_real = torch.randn(hidden_size, N) * 0.2
 
-        scores, ops = compute_d16_pairwise_alignment(U_real, G_real)
-        quads, q_ops, q_scores = select_d16_quadruplets(scores, ops)
+        params, report = convert_mlp_layer_to_d16(U_real, G_real, D_real)
+        # Главное требование: количество объектов D16Complex НЕ уменьшается (24 -> 24)!
+        self.assertEqual(report.orig_intermediate_size, N)
+        self.assertEqual(report.d16_intermediate_size, N)
+        self.assertEqual(params["up_proj.weight"].shape, (N, hidden_size))
+        self.assertEqual(params["gate_proj.weight"].shape, (N, hidden_size))
+        self.assertEqual(params["down_proj.weight"].shape, (hidden_size, N))
 
-        self.assertEqual(quads.shape, (K_true, 4))
-        self.assertEqual(len(set(quads.flatten().tolist())), N)
-        self.assertGreater(float(q_scores.min().item()), 0.999)
-
-        params, report = convert_mlp_layer_to_d16(U_real, G_real, D_real, mode="orbit_4to1")
-        self.assertEqual(report.d16_intermediate_size, K_true)
-        self.assertGreater(report.hadamard_45_pct, 60.0)
+        # При этом анализатор орбит точно находит все 6 орбит со счетом 1.0
+        self.assertEqual(report.quadruplets.shape, (K_true, 4))
+        self.assertEqual(len(set(report.quadruplets.flatten().tolist())), N)
         self.assertAlmostEqual(report.mean_orbit_score, 1.0, places=4)
-        self.assertEqual(params["up_proj.weight"].shape, (K_true, hidden_size))
-        self.assertEqual(params["down_re_proj.weight"].shape, (hidden_size, K_true))
-        self.assertEqual(params["down_im_proj.weight"].shape, (hidden_size, K_true))
 
-    def test_full_1to1_layer_conversion_fidelity_to_swiglu(self) -> None:
+    def test_exact_1to1_layer_equivalence_to_qwen_mlp(self) -> None:
         torch.manual_seed(11)
         hidden_size = 48
         N = 64
@@ -104,7 +101,7 @@ class TestD16GroupMatricesAndOrbitDiscovery(unittest.TestCase):
         G_real = torch.randn(N, hidden_size) / (hidden_size ** 0.5)
         D_real = torch.randn(hidden_size, N) / (N ** 0.5)
 
-        params, report = convert_mlp_layer_to_d16(U_real, G_real, D_real, mode="full_1to1")
+        params, report = convert_mlp_layer_to_d16(U_real, G_real, D_real)
         self.assertEqual(report.d16_intermediate_size, N)
 
         cfg = D16QwenConfig.tiny_test_config(hidden_size=hidden_size, intermediate_size=N)
@@ -114,10 +111,10 @@ class TestD16GroupMatricesAndOrbitDiscovery(unittest.TestCase):
         x = torch.randn(8, 16, hidden_size)
         with torch.no_grad():
             out_d16 = d16_mlp(x)
-            out_swiglu = F.linear(F.linear(x, U_real) * F.silu(F.linear(x, G_real)), D_real)
+            out_qwen = F.linear(F.linear(x, U_real) * F.silu(F.linear(x, G_real)), D_real)
 
-        cos_sim = float(F.cosine_similarity(out_d16.flatten(0, 1), out_swiglu.flatten(0, 1), dim=-1).mean().item())
-        self.assertGreater(cos_sim, 0.98)
+        max_err = float((out_d16 - out_qwen).abs().max().item())
+        self.assertLess(max_err, 1e-5)
 
 
 class TestFullModelStateDictAndCheckpointConversion(unittest.TestCase):
@@ -162,12 +159,13 @@ class TestFullModelStateDictAndCheckpointConversion(unittest.TestCase):
         torch.manual_seed(99)
         cfg_dict, sd = self._create_mock_qwen_checkpoint()
 
-        model_4to1, rep_4to1 = QwenToD16Converter.convert_state_dict(sd, cfg_dict, mode="orbit_4to1")
-        self.assertEqual(model_4to1.config.intermediate_size, 12)
-        self.assertEqual(rep_4to1.global_op_histogram.shape, (16,))
+        model_d16, rep = QwenToD16Converter.convert_state_dict(sd, cfg_dict)
+        self.assertEqual(model_d16.config.intermediate_size, 48)
+        self.assertEqual(rep.d16_intermediate_size, 48)
+        self.assertEqual(rep.global_op_histogram.shape, (16,))
 
         inp = torch.randint(0, 64, (2, 10))
-        out = model_4to1(inp)
+        out = model_d16(inp)
         self.assertEqual(out.logits.shape, (2, 10, 64))
         self.assertTrue(bool(torch.isfinite(out.logits).all()))
 
@@ -176,7 +174,7 @@ class TestFullModelStateDictAndCheckpointConversion(unittest.TestCase):
             (tmp_path / "config.json").write_text(json.dumps(cfg_dict), encoding="utf-8")
             torch.save(sd, tmp_path / "pytorch_model.bin")
 
-            model_disk, rep_disk = QwenToD16Converter.from_pretrained_dir(tmp_path, mode="full_1to1")
+            model_disk, rep_disk = QwenToD16Converter.from_pretrained_dir(tmp_path)
             self.assertEqual(model_disk.config.intermediate_size, 48)
             self.assertEqual(len(rep_disk.layer_reports), 2)
             gen = model_disk.generate(inp[:, :4], max_new_tokens=4)

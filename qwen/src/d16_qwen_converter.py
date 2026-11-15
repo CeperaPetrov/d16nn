@@ -1,17 +1,22 @@
 """Converter and Orbit Analyzer from real Qwen2.5 weights to native D16QwenForCausalLM.
 
-This module converts standard Qwen2/Qwen2.5 state_dicts or checkpoint directories
-into the standalone D16QwenForCausalLM architecture (d16_qwen_model.py) without
-requiring HuggingFace transformers at runtime.
-
-It also produces detailed LayerOrbitReport diagnostics for visualizing how groups
-of real neurons merge into single D16Complex units under the dihedral group Z_8 |>< Z_2.
+Principles:
+1. Every neuron i in a Qwen MLP layer (0..4863) is an independent D16Complex object
+   z_i = (x_i, y_i, rotation_i). The converter preserves all N = 4864 D16Complex
+   objects 1-to-1 without shrinking or deleting neurons.
+2. In parallel, the converter analyzes the Z_8 |>< Z_2 orbit structure across the
+   N D16Complex objects (finding which independent D16Complex objects lie on the
+   same 16-element dihedral orbit and differ in their rotation mask) and packages
+   this into LayerOrbitReport / ConversionReport for visualization.
+3. For experimental verification of orbit sharing, helper methods allow linking
+   the top-M highest-coherence orbit pairs so that the partner D16Complex object
+   at index j derives its state by a pure bitwise shift/reversal of the anchor's
+   16-bit rotation mask (while remaining a separate D16Complex object at index j).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
-import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -46,15 +51,10 @@ OP_NAMES: Tuple[str, ...] = (
     "15: (L-E, -L-E)/√2 [Re, refl 157.5°]",
 )
 
-# Знак квадратичного произведения L' * E' относительно базового базиса (L, E):
-# Для op in 0..7 : L'*E' = OP_QUAD_SIGN[op] * (L * E)         = OP_QUAD_SIGN[op] * 0.5 * Im(z^2)
-# Для op in 8..15: L'*E' = OP_QUAD_SIGN[op] * 0.5*(L^2 - E^2) = OP_QUAD_SIGN[op] * 0.5 * Re(z^2)
 OP_QUAD_SIGN: Tuple[float, ...] = (
     1.0,  1.0, -1.0, -1.0, -1.0, -1.0,  1.0,  1.0,   # 0..7  (Axial Im branch)
     1.0, -1.0,  1.0, -1.0,  1.0, -1.0,  1.0, -1.0,   # 8..15 (Diagonal 45° Re branch)
 )
-
-RAYLEIGH_SIGMOID_KAPPA: float = 15.0 * math.sqrt(math.pi / 2.0) / 8.0  # ~2.349964
 
 
 def d16_group_matrices(
@@ -87,28 +87,28 @@ def d16_group_matrices(
 
 
 # =====================================================================
-# 2. DIAGNOSTIC DATA STRUCTURES FOR VISUALIZATION
+# 2. DIAGNOSTIC DATA STRUCTURES FOR ORBIT VISUALIZATION
 # =====================================================================
 
 @dataclass
 class LayerOrbitReport:
-    """Detailed diagnostic report of Z_8 |>< Z_2 orbit extraction for one MLP layer."""
+    """Diagnostic report of Z_8 |>< Z_2 orbit relationships among the N D16Complex objects."""
 
     layer_idx: int
     mode: str
     orig_intermediate_size: int
     d16_intermediate_size: int
-    quadruplets: torch.Tensor        # [K, 4] original neuron indices in each D16 unit
-    group_ops: torch.Tensor          # [K, 4] operation IDs (0..15) for each member
-    member_scales: torch.Tensor      # [K, 4] projection scales onto canonical basis
-    orbit_scores: torch.Tensor       # [K] coherence score in [0, 1] for each unit
-    local_2x2: torch.Tensor          # [K, 4, 2, 2] local 2D coordinates of each member in (U_q, G_q)
-    op_histogram: torch.Tensor       # [16] counts of operations 0..15 across the layer
-    hadamard_45_pct: float           # Percentage of non-anchor members using 45° Re(z^2) ops (8..15)
+    quadruplets: torch.Tensor        # [K, 4] indices of 4 D16Complex objects on the same local orbit
+    group_ops: torch.Tensor          # [K, 4] relative Z_8 |>< Z_2 operation IDs (0..15)
+    member_scales: torch.Tensor      # [K, 4] relative norm scales ||A_m|| / ||A_0||
+    orbit_scores: torch.Tensor       # [K] alignment cosine score in [0, 1]
+    local_2x2: torch.Tensor          # [K, 4, 2, 2] local 2D coordinates of each object in anchor's frame
+    op_histogram: torch.Tensor       # [16] counts of operations 0..15 across discovered orbits
+    hadamard_45_pct: float           # Percentage of orbit links using 45° Re(z^2) ops (8..15)
     mean_orbit_score: float
 
     def top_orbits(self, k: int = 5) -> List[Dict[str, Union[int, float, List[int], List[str]]]]:
-        """Return human-readable summary of the top-k highest-scoring D16Complex orbits."""
+        """Return human-readable summary of the top-k highest-coherence D16Complex orbit groups."""
         k = min(k, int(self.orbit_scores.numel()))
         vals, idxs = torch.topk(self.orbit_scores, k=k, largest=True)
         result = []
@@ -158,7 +158,7 @@ class ConversionReport:
 
 
 # =====================================================================
-# 3. ORBIT DISCOVERY & ANALYTICAL SECTOR GAIN COMPILATION
+# 3. ORBIT DISCOVERY AMONG INDEPENDENT D16Complex OBJECTS
 # =====================================================================
 
 @torch.no_grad()
@@ -209,7 +209,7 @@ def select_d16_quadruplets(
     best_ops: torch.Tensor,
     num_units: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Greedily partition N neurons into K quadruplets linked by Z_8 |>< Z_2 operations."""
+    """Group N D16Complex objects into K=N//4 disjoint 4-element orbit clusters for inspection."""
     N = best_scores.shape[0]
     K = (N // 4) if num_units is None else min(num_units, N // 4)
     device = best_scores.device
@@ -280,35 +280,49 @@ def select_d16_quadruplets(
 
 
 @torch.no_grad()
-def compute_analytic_sector_gains(
-    gate_sigma: torch.Tensor,
-    op_ids: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Compute analytical 18-state sector gain profile [K, 18] for D16QwenMLP."""
-    device = gate_sigma.device
-    dtype = gate_sigma.dtype
-    K = gate_sigma.shape[0]
+def select_d16_orbit_pairs(
+    best_scores: torch.Tensor,
+    best_ops: torch.Tensor,
+    max_pairs: int = 256,
+    min_score: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select disjoint pairs (anchor_i, partner_j, op_id, score) of D16Complex objects on the same orbit."""
+    N = best_scores.shape[0]
+    device = best_scores.device
+    upper = torch.triu(best_scores, diagonal=1)
+    flat_scores, flat_idx = torch.sort(upper.flatten(), descending=True)
 
-    angles = (torch.arange(16, dtype=torch.float64, device=device) + 0.5) * (math.pi / 8.0)
-    cos_a = angles.cos()
-    sin_a = angles.sin()
+    used = torch.zeros(N, dtype=torch.bool, device=device)
+    anchors: List[int] = []
+    partners: List[int] = []
+    ops: List[int] = []
+    scores: List[float] = []
 
-    if op_ids is None:
-        dir_e = sin_a.unsqueeze(0).expand(K, 16)
-    else:
-        mats = d16_group_matrices(dtype=torch.float64, device=device)[op_ids]
-        dir_e = mats[:, 1, 0:1] * cos_a.unsqueeze(0) + mats[:, 1, 1:2] * sin_a.unsqueeze(0)
+    for sc_t, idx_t in zip(flat_scores, flat_idx):
+        sc = float(sc_t.item())
+        if sc <= min_score or len(anchors) >= max_pairs:
+            break
+        idx = int(idx_t.item())
+        i, j = idx // N, idx % N
+        if bool(used[i]) or bool(used[j]):
+            continue
+        used[i] = True
+        used[j] = True
+        anchors.append(i)
+        partners.append(j)
+        ops.append(int(best_ops[i, j].item()))
+        scores.append(sc)
 
-    eff_arg = RAYLEIGH_SIGMOID_KAPPA * gate_sigma.to(torch.float64).unsqueeze(1) * dir_e
-    gains_16 = torch.sigmoid(eff_arg).to(dtype)
-
-    gains_18 = torch.zeros((K, 18), dtype=dtype, device=device)
-    gains_18[:, :16] = gains_16
-    return gains_18
+    return (
+        torch.tensor(anchors, dtype=torch.long, device=device),
+        torch.tensor(partners, dtype=torch.long, device=device),
+        torch.tensor(ops, dtype=torch.long, device=device),
+        torch.tensor(scores, dtype=best_scores.dtype, device=device),
+    )
 
 
 # =====================================================================
-# 4. LAYER CONVERSION (ORBIT 4->1 AND FULL 1->1)
+# 4. LAYER CONVERSION (PRESERVING ALL N D16Complex OBJECTS)
 # =====================================================================
 
 @torch.no_grad()
@@ -318,9 +332,13 @@ def convert_mlp_layer_to_d16(
     down_weight: torch.Tensor,
     rms_weight: Optional[torch.Tensor] = None,
     layer_idx: int = 0,
-    mode: str = "orbit_4to1",
+    mode: str = "native_d16",
+    analyze_orbits: bool = True,
 ) -> Tuple[Dict[str, torch.Tensor], LayerOrbitReport]:
-    """Convert a real Qwen MLP layer (up, gate, down) into D16QwenMLP parameters + report."""
+    """Convert a Qwen MLP layer into N independent D16Complex objects + orbit report.
+
+    Every neuron i in 0..N-1 remains an independent D16Complex object.
+    """
     device = up_weight.device
     orig_dtype = up_weight.dtype
     calc_dtype = torch.float32
@@ -330,161 +348,59 @@ def convert_mlp_layer_to_d16(
     D_mat = down_weight.detach().to(calc_dtype)
     N, hidden_size = U.shape
 
+    params = {
+        "up_proj.weight": U.to(orig_dtype).clone(),
+        "gate_proj.weight": G.to(orig_dtype).clone(),
+        "down_proj.weight": D_mat.to(orig_dtype).clone(),
+    }
+
+    if not analyze_orbits:
+        empty_i = torch.zeros((0, 4), dtype=torch.long)
+        report = LayerOrbitReport(
+            layer_idx=layer_idx,
+            mode=mode,
+            orig_intermediate_size=N,
+            d16_intermediate_size=N,
+            quadruplets=empty_i,
+            group_ops=empty_i,
+            member_scales=torch.zeros((0, 4)),
+            orbit_scores=torch.zeros(0),
+            local_2x2=torch.zeros((0, 4, 2, 2)),
+            op_histogram=torch.zeros(16, dtype=torch.long),
+            hadamard_45_pct=0.0,
+            mean_orbit_score=0.0,
+        )
+        return params, report
+
     if rms_weight is not None:
         rms_w = rms_weight.detach().to(device=device, dtype=calc_dtype)
     else:
         rms_w = torch.ones(hidden_size, dtype=calc_dtype, device=device)
 
     best_scores, best_ops = compute_d16_pairwise_alignment(U, G, rms_w)
-    mats = d16_group_matrices(dtype=calc_dtype, device=device)
-    quad_signs = torch.tensor(OP_QUAD_SIGN, dtype=calc_dtype, device=device)
-
-    if mode == "full_1to1":
-        K = N
-        top3_sc, top3_idx = torch.topk(best_scores, k=min(3, N - 1), dim=1)
-        anchors = torch.arange(N, dtype=torch.long, device=device).unsqueeze(1)
-        quads = torch.cat([anchors, top3_idx], dim=1)
-        anchor_ops = torch.zeros((N, 1), dtype=torch.long, device=device)
-        partner_ops = torch.gather(best_ops, dim=1, index=top3_idx)
-        q_ops = torch.cat([anchor_ops, partner_ops], dim=1)
-        q_scores = top3_sc.mean(dim=1)
-
-        U_d16 = U.clone()
-        G_d16 = G.clone()
-
-        sigma_e = (G * rms_w.unsqueeze(0)).norm(dim=1).clamp_min(1e-6)
-        sector_im_gain = compute_analytic_sector_gains(sigma_e)
-        sector_re_gain = torch.zeros_like(sector_im_gain)
-
-        down_im_proj = D_mat.clone()
-        down_re_proj = torch.zeros_like(D_mat)
-
-        A_all = torch.stack([U, G], dim=1)
-        basis_norm = A_all / A_all.norm(dim=(1, 2), keepdim=True).clamp_min(1e-12)
-        member_A = A_all[quads]
-        local_2x2 = torch.einsum("qad,qmbd->qmba", basis_norm, member_A)
-        member_scales = torch.ones((N, 4), dtype=calc_dtype, device=device)
-        member_scales[:, 1:] = top3_sc
-
-        op_hist = torch.bincount(partner_ops.flatten().cpu(), minlength=16)
-        hadamard_pct = float((partner_ops >= 8).float().mean().item() * 100.0)
-
-        params = {
-            "up_proj.weight": U_d16.to(orig_dtype),
-            "gate_proj.weight": G_d16.to(orig_dtype),
-            "sector_re_gain": sector_re_gain.to(orig_dtype),
-            "sector_im_gain": sector_im_gain.to(orig_dtype),
-            "down_re_proj.weight": down_re_proj.to(orig_dtype),
-            "down_im_proj.weight": down_im_proj.to(orig_dtype),
-        }
-        report = LayerOrbitReport(
-            layer_idx=layer_idx,
-            mode=mode,
-            orig_intermediate_size=N,
-            d16_intermediate_size=K,
-            quadruplets=quads.cpu(),
-            group_ops=q_ops.cpu(),
-            member_scales=member_scales.cpu(),
-            orbit_scores=q_scores.cpu(),
-            local_2x2=local_2x2.cpu(),
-            op_histogram=op_hist,
-            hadamard_45_pct=hadamard_pct,
-            mean_orbit_score=float(q_scores.mean().item()),
-        )
-        return params, report
-
-    if mode != "orbit_4to1":
-        raise ValueError(f"Unsupported conversion mode: {mode}. Use 'orbit_4to1' or 'full_1to1'.")
-
     quads, q_ops, q_scores = select_d16_quadruplets(best_scores, best_ops)
-    K = quads.shape[0]
 
     A_all = torch.stack([U, G], dim=1)
     norms_all = A_all.norm(dim=(1, 2), keepdim=True).clamp_min(1e-12)
     A_unit = A_all / norms_all
 
-    member_unit = A_unit[quads]
-    member_raw = A_all[quads]
-    M_q = mats[q_ops]
+    # Express each of the 4 objects in the anchor object's 2D reference frame
+    anchor_frame = A_unit[quads[:, 0]]  # [K, 2, D]
+    member_raw = A_all[quads]           # [K, 4, 2, D]
+    local_2x2 = torch.einsum("qad,qmbd->qmba", anchor_frame, member_raw)
 
-    aligned_dirs = torch.einsum("qmba,qmbd->qmad", M_q, member_unit)
-    canon_dir = aligned_dirs.mean(dim=1)
-    canon_dir = canon_dir / canon_dir.norm(dim=(1, 2), keepdim=True).clamp_min(1e-12)
-
-    anchor_norms = norms_all[quads[:, 0], 0, 0]
-    B_canon = canon_dir * anchor_norms[:, None, None]
-    U_d16 = B_canon[:, 0, :]
-    G_d16 = B_canon[:, 1, :]
-
-    mapped_B = torch.einsum("qmab,qbd->qmad", M_q, B_canon)
-    denom = mapped_B.square().sum(dim=(2, 3)).clamp_min(1e-12)
-    member_scales = (member_raw * mapped_B).sum(dim=(2, 3)) / denom
-
-    local_2x2 = torch.einsum("qad,qmbd->qmba", canon_dir, member_raw)
-
-    sigma_base = (G_d16 * rms_w.unsqueeze(0)).norm(dim=1).clamp_min(1e-6)
-
-    down_im_proj = torch.zeros((hidden_size, K), dtype=calc_dtype, device=device)
-    down_re_proj = torch.zeros((hidden_size, K), dtype=calc_dtype, device=device)
-    sector_im_accum = torch.zeros((K, 18), dtype=calc_dtype, device=device)
-    sector_re_accum = torch.zeros((K, 18), dtype=calc_dtype, device=device)
-    im_weight_sum = torch.zeros(K, dtype=calc_dtype, device=device)
-    re_weight_sum = torch.zeros(K, dtype=calc_dtype, device=device)
-
-    for m in range(4):
-        idx_m = quads[:, m]
-        op_m = q_ops[:, m]
-        scale_m = member_scales[:, m]
-        quad_scale = scale_m.square() * quad_signs[op_m]
-        d_m = D_mat[:, idx_m]
-        d_norm_m = d_m.norm(dim=0).clamp_min(1e-8)
-
-        gains_m = compute_analytic_sector_gains(sigma_base * scale_m.abs(), op_m)
-        is_re_branch = op_m >= 8
-
-        im_mask = (~is_re_branch).to(calc_dtype)
-        re_mask = is_re_branch.to(calc_dtype)
-
-        down_im_proj += d_m * (quad_scale * im_mask).unsqueeze(0)
-        down_re_proj += d_m * (0.5 * quad_scale * re_mask).unsqueeze(0)
-
-        w_im = d_norm_m * scale_m.square() * im_mask
-        w_re = d_norm_m * scale_m.square() * re_mask
-
-        sector_im_accum += gains_m * w_im.unsqueeze(1)
-        sector_re_accum += gains_m * w_re.unsqueeze(1)
-        im_weight_sum += w_im
-        re_weight_sum += w_re
-
-    default_gains = compute_analytic_sector_gains(sigma_base)
-    sector_im_gain = torch.where(
-        (im_weight_sum > 1e-7).unsqueeze(1),
-        sector_im_accum / im_weight_sum.clamp_min(1e-7).unsqueeze(1),
-        default_gains,
-    )
-    sector_re_gain = torch.where(
-        (re_weight_sum > 1e-7).unsqueeze(1),
-        sector_re_accum / re_weight_sum.clamp_min(1e-7).unsqueeze(1),
-        default_gains,
-    )
+    anchor_norms = norms_all[quads[:, 0], 0, 0].unsqueeze(1).clamp_min(1e-12)
+    member_scales = norms_all[quads, 0, 0] / anchor_norms
 
     non_anchor_ops = q_ops[:, 1:].flatten()
     op_hist = torch.bincount(non_anchor_ops.cpu(), minlength=16)
     hadamard_pct = float((non_anchor_ops >= 8).float().mean().item() * 100.0)
 
-    params = {
-        "up_proj.weight": U_d16.to(orig_dtype),
-        "gate_proj.weight": G_d16.to(orig_dtype),
-        "sector_re_gain": sector_re_gain.to(orig_dtype),
-        "sector_im_gain": sector_im_gain.to(orig_dtype),
-        "down_re_proj.weight": down_re_proj.to(orig_dtype),
-        "down_im_proj.weight": down_im_proj.to(orig_dtype),
-    }
     report = LayerOrbitReport(
         layer_idx=layer_idx,
         mode=mode,
         orig_intermediate_size=N,
-        d16_intermediate_size=K,
+        d16_intermediate_size=N,  # All N D16Complex objects are preserved!
         quadruplets=quads.cpu(),
         group_ops=q_ops.cpu(),
         member_scales=member_scales.cpu(),
@@ -502,27 +418,18 @@ def convert_mlp_layer_to_d16(
 # =====================================================================
 
 class QwenToD16Converter:
-    """Offline & in-memory converter from standard Qwen2/Qwen2.5 to D16QwenForCausalLM."""
+    """Converter and Z_8 |>< Z_2 Orbit Inspector from Qwen2/Qwen2.5 to D16QwenForCausalLM."""
 
     @staticmethod
     def config_from_qwen_dict(
         qwen_cfg: Dict[str, Union[int, float, bool, str]],
-        mode: str = "orbit_4to1",
         indiff_eps: float = 0.0,
     ) -> D16QwenConfig:
-        """Build D16QwenConfig from a standard Qwen config.json dictionary."""
-        orig_inter = int(qwen_cfg.get("intermediate_size", 4864))
-        if mode == "orbit_4to1":
-            d16_inter = orig_inter // 4
-        elif mode == "full_1to1":
-            d16_inter = orig_inter
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
-
+        """Build D16QwenConfig preserving all N D16Complex objects per layer."""
         return D16QwenConfig(
             vocab_size=int(qwen_cfg.get("vocab_size", 151936)),
             hidden_size=int(qwen_cfg.get("hidden_size", 896)),
-            intermediate_size=d16_inter,
+            intermediate_size=int(qwen_cfg.get("intermediate_size", 4864)),
             num_hidden_layers=int(qwen_cfg.get("num_hidden_layers", 24)),
             num_attention_heads=int(qwen_cfg.get("num_attention_heads", 14)),
             num_key_value_heads=int(qwen_cfg.get("num_key_value_heads", 2)),
@@ -541,12 +448,13 @@ class QwenToD16Converter:
         cls,
         qwen_state_dict: Dict[str, torch.Tensor],
         qwen_config_dict: Dict[str, Union[int, float, bool, str]],
-        mode: str = "orbit_4to1",
+        mode: str = "native_d16",
         indiff_eps: float = 0.0,
+        analyze_orbits: bool = True,
         device: Union[str, torch.device] = "cpu",
     ) -> Tuple[D16QwenForCausalLM, ConversionReport]:
-        """Convert an in-memory Qwen state_dict into a ready D16QwenForCausalLM + ConversionReport."""
-        d16_cfg = cls.config_from_qwen_dict(qwen_config_dict, mode=mode, indiff_eps=indiff_eps)
+        """Convert an in-memory Qwen state_dict into D16QwenForCausalLM + ConversionReport."""
+        d16_cfg = cls.config_from_qwen_dict(qwen_config_dict, indiff_eps=indiff_eps)
         d16_model = D16QwenForCausalLM(d16_cfg).to(device)
         new_sd = d16_model.state_dict()
 
@@ -597,6 +505,7 @@ class QwenToD16Converter:
                 rms_weight=post_norm_w.to(device),
                 layer_idx=l_idx,
                 mode=mode,
+                analyze_orbits=analyze_orbits,
             )
             report.layer_reports[l_idx] = layer_rep
 
@@ -610,8 +519,9 @@ class QwenToD16Converter:
     def from_pretrained_dir(
         cls,
         model_dir: Union[str, Path],
-        mode: str = "orbit_4to1",
+        mode: str = "native_d16",
         indiff_eps: float = 0.0,
+        analyze_orbits: bool = True,
         device: Union[str, torch.device] = "cpu",
     ) -> Tuple[D16QwenForCausalLM, ConversionReport]:
         """Load a local Qwen checkpoint directory (.safetensors or .bin) and convert to D16Qwen."""
@@ -640,20 +550,60 @@ class QwenToD16Converter:
             qwen_config_dict=qwen_cfg,
             mode=mode,
             indiff_eps=indiff_eps,
+            analyze_orbits=analyze_orbits,
             device=device,
         )
+
+    @staticmethod
+    @torch.no_grad()
+    def activate_bitwise_orbit_links(
+        model: D16QwenForCausalLM,
+        report: ConversionReport,
+        pairs_per_layer: int = 0,
+        min_orbit_score: float = 0.35,
+    ) -> int:
+        """Link top orbit pairs so partner D16Complex objects rotate anchor's mask via Z_8 |>< Z_2.
+
+        Note: The number of D16Complex objects in every layer remains N (4864).
+        When pairs_per_layer == 0, clears all links so every object uses its own (x, y, rotation).
+        """
+        total_linked = 0
+        for l_idx, layer in enumerate(model.model.layers):
+            if pairs_per_layer <= 0 or l_idx not in report.layer_reports:
+                layer.mlp.clear_orbit_links()
+                continue
+
+            rep = report.layer_reports[l_idx]
+            # First member (col 1) of each sorted quadruplet is the strongest partner of anchor (col 0)
+            valid = rep.orbit_scores >= min_orbit_score
+            k = min(pairs_per_layer, int(valid.sum().item()))
+            if k <= 0:
+                layer.mlp.clear_orbit_links()
+                continue
+
+            anchors = rep.quadruplets[:k, 0]
+            partners = rep.quadruplets[:k, 1]
+            ops = rep.group_ops[:k, 1]
+            scales = rep.member_scales[:k, 1]
+            layer.mlp.set_orbit_links(
+                partner_idx=partners,
+                anchor_idx=anchors,
+                op_ids=ops,
+                scales=scales,
+            )
+            total_linked += k
+        return total_linked
 
 
 __all__ = [
     "OP_NAMES",
     "OP_QUAD_SIGN",
-    "RAYLEIGH_SIGMOID_KAPPA",
     "d16_group_matrices",
     "LayerOrbitReport",
     "ConversionReport",
     "compute_d16_pairwise_alignment",
     "select_d16_quadruplets",
-    "compute_analytic_sector_gains",
+    "select_d16_orbit_pairs",
     "convert_mlp_layer_to_d16",
     "QwenToD16Converter",
 ]

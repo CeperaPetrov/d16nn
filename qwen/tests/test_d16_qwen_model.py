@@ -1,4 +1,4 @@
-"""Unit and training-from-scratch tests for the pure native d16_qwen_model.py.
+"""Unit and training-from-scratch tests for d16_qwen_model.py.
 
 Can be executed via:
     python tests/test_d16_qwen_model.py
@@ -21,6 +21,7 @@ for _candidate in (
         break
 
 import torch
+import torch.nn.functional as F
 
 from d16_qwen_model import (
     D16QwenConfig,
@@ -40,7 +41,7 @@ class TestD16QwenComponents(unittest.TestCase):
         x = torch.randn(4, 16, 64) * 5.0
         y = norm(x)
         rms = y.detach().pow(2).mean(dim=-1).sqrt()
-        self.assertLess(float((rms - 1.0).abs().max()), 1e-5)
+        self.assertLess(float((rms - 1.0).abs().max().item()), 1e-5)
 
     def test_d16_rotary_embedding_matches_exact_complex_rotation(self) -> None:
         torch.manual_seed(1)
@@ -58,27 +59,64 @@ class TestD16QwenComponents(unittest.TestCase):
         k_re, k_im = k[..., :8], k[..., 8:]
         k_ref = torch.cat([k_re * cos_b - k_im * sin_b, k_re * sin_b + k_im * cos_b], dim=-1)
 
-        self.assertLess(float((q_rot - q_ref).abs().max()), 1e-13)
-        self.assertLess(float((k_rot - k_ref).abs().max()), 1e-13)
-        self.assertLess(float((q_rot.norm(dim=-1) - q.norm(dim=-1)).abs().max()), 1e-13)
+        self.assertLess(float((q_rot - q_ref).abs().max().item()), 1e-13)
+        self.assertLess(float((k_rot - k_ref).abs().max().item()), 1e-13)
+        self.assertLess(float((q_rot.norm(dim=-1) - q.norm(dim=-1)).abs().max().item()), 1e-13)
 
-    def test_native_d16_mlp_forward_and_gradients(self) -> None:
+    def test_native_d16_mlp_wedge_branching_and_gradients(self) -> None:
         torch.manual_seed(2)
         cfg = D16QwenConfig.tiny_test_config()
-        mlp = D16QwenMLP(cfg)
-        x = torch.randn(3, 10, cfg.hidden_size, requires_grad=True)
+        mlp = D16QwenMLP(cfg).double()
+        x = torch.randn(3, 10, cfg.hidden_size, dtype=torch.float64, requires_grad=True)
 
         out = mlp(x)
         self.assertEqual(out.shape, x.shape)
-        out.square().mean().backward()
 
+        # Проверяем, что секторное ветвление _eval_d16(z) внутри клина [0°, 22.5°]
+        # (x*y на осевых секторах и 0.5*(x^2 - y^2) на диагональных) дает точность < 1e-13
+        with torch.no_grad():
+            L = mlp.up_proj(x)
+            E = mlp.gate_proj(x)
+            ref_out = mlp.down_proj(L * F.silu(E))
+            self.assertLess(float((out.detach() - ref_out).abs().max().item()), 1e-13)
+
+        out.square().mean().backward()
         self.assertIsNotNone(x.grad)
         self.assertIsNotNone(mlp.up_proj.weight.grad)
         self.assertIsNotNone(mlp.gate_proj.weight.grad)
-        self.assertIsNotNone(mlp.sector_re_gain.grad)
-        self.assertIsNotNone(mlp.sector_im_gain.grad)
-        self.assertIsNotNone(mlp.down_re_proj.weight.grad)
-        self.assertIsNotNone(mlp.down_im_proj.weight.grad)
+        self.assertIsNotNone(mlp.down_proj.weight.grad)
+
+    def test_bitwise_orbit_links_preserve_object_count_and_rotate_mask(self) -> None:
+        torch.manual_seed(5)
+        cfg = D16QwenConfig.tiny_test_config(hidden_size=32, intermediate_size=16)
+        mlp = D16QwenMLP(cfg).double()
+
+        # Задаем нейрон 1 как 45°-партнера Адамара (op_id=8: rol на 2 бита) нейрона 0
+        s = 2.0 ** -0.5
+        with torch.no_grad():
+            u0 = mlp.up_proj.weight[0].clone()
+            g0 = mlp.gate_proj.weight[0].clone()
+            mlp.up_proj.weight[1].copy_(s * (u0 - g0))
+            mlp.gate_proj.weight[1].copy_(s * (u0 + g0))
+
+        x = torch.randn(4, 6, 32, dtype=torch.float64)
+        with torch.no_grad():
+            out_independent = mlp(x)
+            # Теперь включаем побитовую связь орбиты: объект #1 берет (x, y) от #0 и сдвигает только маску rotation!
+            mlp.set_orbit_links(
+                partner_idx=torch.tensor([1]),
+                anchor_idx=torch.tensor([0]),
+                op_ids=torch.tensor([8]),
+            )
+            z_objs = mlp.forward_d16_objects(x)
+            out_linked = mlp(x)
+
+        # Количество объектов D16Complex осталось ровно 16!
+        self.assertEqual(z_objs.shape, (4, 6, 16))
+        # Координаты (x, y) у объектов #0 и #1 в клине [0°, 22.5°] идентичны, а rotation сдвинут на 2 бита:
+        self.assertLess(float((z_objs.x[..., 0] - z_objs.x[..., 1]).abs().max().item()), 1e-14)
+        self.assertLess(float((z_objs.y[..., 0] - z_objs.y[..., 1]).abs().max().item()), 1e-14)
+        self.assertLess(float((out_independent - out_linked).abs().max().item()), 1e-13)
 
 
 class TestD16QwenInferenceCacheAndTelemetry(unittest.TestCase):
@@ -96,7 +134,7 @@ class TestD16QwenInferenceCacheAndTelemetry(unittest.TestCase):
             prefill = model(input_ids[:, :-1], use_cache=True)
             step_out = model(input_ids[:, -1:], past_key_values=prefill.past_key_values, use_cache=True)
 
-            self.assertLess(float((full_out.logits[:, -1, :] - step_out.logits[:, -1, :]).abs().max()), 1e-4)
+            self.assertLess(float((full_out.logits[:, -1, :] - step_out.logits[:, -1, :]).abs().max().item()), 1e-4)
 
             gen_cached = model.generate(input_ids[:, :4], max_new_tokens=6, do_sample=False, use_cache=True)
             gen_nocache = model.generate(input_ids[:, :4], max_new_tokens=6, do_sample=False, use_cache=False)
@@ -125,11 +163,12 @@ class TestD16QwenInferenceCacheAndTelemetry(unittest.TestCase):
         self.assertEqual(int(summary_eps["state_counts"][16]), summary_eps["indifferent_elements"])
 
         model.set_indifferent_threshold(0.0)
-        out_id = model(input_ids).logits[:, -1, :]
-        model.set_sector_steering(mode="active_swap_le")
-        out_steered = model(input_ids).logits[:, -1, :]
-        model.set_sector_steering(mode="identity")
-        self.assertGreater(float((out_id - out_steered).abs().max()), 1e-4)
+        with torch.no_grad():
+            out_id = model(input_ids).logits[:, -1, :]
+            model.set_sector_steering(mode="active_swap_le")
+            out_steered = model(input_ids).logits[:, -1, :]
+            model.set_sector_steering(mode="identity")
+        self.assertGreater(float((out_id - out_steered).abs().max().item()), 1e-4)
         self.assertTrue(bool(torch.isfinite(out_steered).all()))
 
 
