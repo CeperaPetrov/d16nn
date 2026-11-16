@@ -7,59 +7,35 @@ import math
 
 import torch
 
-from d16_complex import D16ComplexTensor, MASK_ZERO, reverse_bits_u16
+from d16_complex import D16ComplexTensor
 from d16_parameter import D16Parameter
-from d16_qwen_model2 import _chart_parameters, _complex_add, _from_real, _real_add, _scale_wedge
 
 
 @dataclass
 class _Moments:
     step: int
     first: D16ComplexTensor
-    # A nonnegative real-axis value has y=0 and its mask follows from its radius.
-    second_radius: torch.Tensor
+    second: D16ComplexTensor
 
 
 def _accumulation_dtype(value: torch.Tensor) -> torch.dtype:
     return torch.float64 if value.dtype == torch.float64 else torch.float32
 
 
-def _gradient_in_weight_chart(grad_x, grad_y, weight: D16ComplexTensor) -> D16ComplexTensor:
-    """Encode the signed local tangent and compose its mask with the weight chart."""
-    local = D16ComplexTensor.from_xy(grad_x, grad_y)
-    turns, reflected = _chart_parameters(weight.rotation)
-    mask = torch.where(reflected, reverse_bits_u16(local.rotation), local.rotation)
-    shift = turns * 2
-    rotation = ((mask << shift) | (mask >> ((-shift) & 15))) & MASK_ZERO
-    return D16ComplexTensor(local.x, local.y, rotation)
-
-
-def _round_coordinates(value: D16ComplexTensor, dtype: torch.dtype) -> D16ComplexTensor:
-    if value.dtype == dtype:
-        return value
-    x, y = value.x.to(dtype), value.y.to(dtype)
-    undefined = value.is_nan() | ~torch.isfinite(x) | ~torch.isfinite(y)
-    return D16ComplexTensor.make(
-        x.masked_fill(undefined, 0), y.masked_fill(undefined, 0), value.rotation.masked_fill(undefined, 0),
-    )
-
-
 def _new_moments(parameter: D16Parameter) -> _Moments:
-    x, y, rotation = parameter.x, parameter.y, parameter.rotation
-    dtype = _accumulation_dtype(x)
-    first = D16ComplexTensor(
-        torch.zeros_like(x, dtype=dtype), torch.zeros_like(y, dtype=dtype),
-        torch.full_like(rotation, MASK_ZERO),
-    )
-    return _Moments(0, first, torch.zeros_like(x, dtype=dtype))
+    dtype = _accumulation_dtype(parameter.x)
+    first = D16ComplexTensor.zeros_like(parameter.value(), dtype=dtype)
+    second = D16ComplexTensor.zeros_like(parameter.value(), dtype=dtype)
+    return _Moments(0, first, second)
 
 
 class D16AdamW:
-    """AdamW with a complex first moment and a shared radial second moment.
+    """AdamW operating purely through D16ComplexTensor arithmetic (+, -, *).
 
-    Each pair of coordinate gradients describes a tangent in the weight's chart.
-    Its squared norm is the second-moment sample, so both complex components use
-    the same adaptive gain. The update and decay produce a canonical D16 value.
+    First moments are complex D16ComplexTensor objects accumulated via D16 addition.
+    Second moments are real-axis D16ComplexTensor objects accumulated via real_add.
+    Weight updates and decay are executed via D16 multiplication and subtraction,
+    automatically updating sector masks inside D16ComplexTensor.
     """
 
     def __init__(
@@ -114,70 +90,73 @@ class D16AdamW:
             torch.linalg.vector_norm(g, dtype=_accumulation_dtype(g)).to(first_parameter.device)
             for pair in grads for g in pair if g is not None
         ]
-        total_norm = (torch.linalg.vector_norm(torch.stack(norms)) if norms else
-                      first_parameter.new_zeros((), dtype=_accumulation_dtype(first_parameter)))
+        total_norm = (
+            torch.linalg.vector_norm(torch.stack(norms))
+            if norms
+            else first_parameter.new_zeros((), dtype=_accumulation_dtype(first_parameter))
+        )
         if not bool(torch.isfinite(total_norm)):
             raise RuntimeError("D16 tangent norm is nonfinite")
         clip = None if max_grad_norm is None else (max_grad_norm / (total_norm + 1e-6)).clamp(max=1)
 
-        for i, (parameter, (grad_x, grad_y)) in enumerate(zip(self.parameters, grads)):
-            if grad_x is None and grad_y is None:
+        for i, parameter in enumerate(self.parameters):
+            if not parameter.has_grad():
                 continue
             moments = self._moments[i]
             if moments is None:
                 moments = self._moments[i] = _new_moments(parameter)
-            self._update(parameter, grad_x, grad_y, moments, clip)
+            self._update(parameter, moments, clip)
         return total_norm
 
-    def _update(self, parameter, grad_x, grad_y, moments, clip) -> None:
+    def _update(self, parameter: D16Parameter, moments: _Moments, clip: torch.Tensor | None) -> None:
         beta1, beta2 = self.betas
         moments.step += 1
-        step_size = self.lr / (1 - beta1 ** moments.step)
-        correction2 = 1 - beta2 ** moments.step
-        decay = 1 - self.lr * self.weight_decay
+        step_size = self.lr / (1.0 - beta1 ** moments.step)
+        correction2 = 1.0 - beta2 ** moments.step
+        decay = 1.0 - self.lr * self.weight_decay
         dtype = moments.first.dtype
         weights = parameter.value()
-        coeff = moments.second_radius.new_tensor([beta1, beta2, 1 - beta1, 1 - beta2, abs(decay)])
-        clip = None if clip is None else clip.to(device=weights.device, dtype=dtype)
+        clip_val = None if clip is None else clip.to(device=weights.device, dtype=dtype)
 
         for index in self._tiles(parameter):
             stored_weight = weights[index]
             weight = stored_weight.to(dtype=dtype)
-            gx = torch.zeros_like(weight.x) if grad_x is None else grad_x[index].to(dtype)
-            gy = torch.zeros_like(weight.y) if grad_y is None else grad_y[index].to(dtype)
-            gradient = _gradient_in_weight_chart(gx, gy, weight)
-            if clip is not None:
-                gradient = _scale_wedge(gradient, clip)
+            gradient = parameter.grad_d16(index=index, dtype=dtype)
+            if clip_val is not None:
+                gradient = gradient * clip_val
 
-            previous = moments.first[index]
-            first = _complex_add(_scale_wedge(previous, coeff[0]), _scale_wedge(gradient, coeff[2]))
-            magnitude_squared = _from_real(gradient.norm_squared().masked_fill(gradient.is_nan(), torch.nan))
-            second = _real_add(
-                _scale_wedge(_from_real(moments.second_radius[index]), coeff[1]),
-                _scale_wedge(magnitude_squared, coeff[3]),
-            )
-            second_radius = second.x.masked_fill(second.is_nan(), torch.nan)
-            delta = _scale_wedge(first, step_size / ((second_radius / correction2).sqrt() + self.eps))
-            decayed = _scale_wedge(weight, coeff[4])
-            if decay < 0:
-                decayed = decayed.negate()
-            updated = _complex_add(decayed, delta.negate())
-            parameter.copy_(_round_coordinates(updated, stored_weight.dtype), index=index)
+            prev_first = moments.first[index]
+            prev_second = moments.second[index]
 
-            previous.x.copy_(first.x)
-            previous.y.copy_(first.y)
-            previous.rotation.copy_(first.rotation)
-            moments.second_radius[index].copy_(second_radius)
+            first = prev_first * beta1 + gradient * (1.0 - beta1)
+            second = (prev_second * beta2).real_add(gradient.norm_squared_d16() * (1.0 - beta2))
+
+            second_radius = second.real_signed()
+            denom = (second_radius / correction2).sqrt() + self.eps
+            delta = first * (step_size / denom)
+            updated = weight * decay - delta
+
+            parameter.copy_(updated.round_to_dtype(stored_weight.dtype), index=index)
+            moments.first.copy_slice_(index, first)
+            moments.second.copy_slice_(index, second)
 
     def state_dict(self) -> dict:
         """Serialize optimizer moments using tensors and primitive metadata."""
         return {
             "format_version": 1,
-            "lr": self.lr, "betas": self.betas, "eps": self.eps, "weight_decay": self.weight_decay,
+            "lr": self.lr,
+            "betas": self.betas,
+            "eps": self.eps,
+            "weight_decay": self.weight_decay,
             "moments": [
-                None if item is None else {
-                    "step": item.step, "first_x": item.first.x, "first_y": item.first.y,
-                    "first_rotation": item.first.rotation, "second_radius": item.second_radius,
+                None
+                if item is None
+                else {
+                    "step": item.step,
+                    "first_x": item.first.x,
+                    "first_y": item.first.y,
+                    "first_rotation": item.first.rotation,
+                    "second_radius": item.second.x,
                 }
                 for item in self._moments
             ],
@@ -197,11 +176,16 @@ class D16AdamW:
             if entry["first_rotation"].dtype != parameter.rotation.dtype:
                 raise ValueError("D16AdamW sector mask dtype does not match the parameter")
             device, dtype = parameter.x.device, _accumulation_dtype(parameter.x)
-            first_x, first_y, second = (
+            first_x, first_y, second_r = (
                 entry[name].to(device=device, dtype=dtype, copy=True)
                 for name in ("first_x", "first_y", "second_radius")
             )
             rotation = entry["first_rotation"].to(device=device, copy=True)
-            restored.append(_Moments(entry["step"], D16ComplexTensor(first_x, first_y, rotation), second))
+            first = D16ComplexTensor(first_x, first_y, rotation)
+            second = D16ComplexTensor.from_real(second_r)
+            restored.append(_Moments(entry["step"], first, second))
         self._set_options(*(state_dict[name] for name in ("lr", "betas", "eps", "weight_decay")))
         self._moments = restored
+
+
+__all__ = ["D16AdamW"]

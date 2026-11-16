@@ -16,9 +16,10 @@ without modifying (x, y).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 from numbers import Real
-from typing import Tuple, Union
+from typing import Callable, Optional, Sequence, Tuple, Union
 
 try:
     import torch
@@ -39,6 +40,10 @@ EPS_BOUND: float = 1e-12
 
 MASK_ZERO: int = 0xFFFF  # State 16: Indifferent (Zero)
 MASK_NAN: int = 0x0000   # State 17: Undefined (NaN)
+
+# Canonical boundary masks of the real-line subalgebra in D16
+REAL_POSITIVE: int = 0x8001
+REAL_NEGATIVE: int = 0x0180
 
 STATE_INDIFFERENT: int = 16
 STATE_UNDEFINED: int = 17
@@ -225,7 +230,7 @@ def _fold_local_displacement(u: float, v: float) -> Tuple[float, float, int, boo
 
 
 # =====================================================================
-# 3. SCALAR D16Complex OBJECT (PORT OF struct D16Complex & D8Complex)
+# 3. SCALAR D16Complex OBJECT
 # =====================================================================
 
 @dataclass(frozen=True, slots=True)
@@ -273,17 +278,14 @@ class D16Complex:
 
         if is_one_hot(m):
             k = bit_index(m)
-            # 1. Swap x/y while preserving value: even k -> k+3, odd k -> k-3 (mod 16)
             if y > x:
                 x, y = y, x
                 k = (k + (13 if (k & 1) else 3)) & 15
-            # 2. Fold across 22.5° bisector if above_bisector(x, y)
             if above_bisector(x, y):
                 nx = rotated_sum(x, y)
                 ny = (x - y) * INV_SQRT2
                 x, y = nx, ny
                 k ^= 1
-            # 3. Snap to boundary mask if on y=0 or on 22.5° bisector
             if y <= EPS_BOUND * x:
                 y = 0.0
                 neighbor = ((k + 1) & 15) if (k & 1) else ((k + 15) & 15)
@@ -316,8 +318,6 @@ class D16Complex:
         object.__setattr__(self, "x", x)
         object.__setattr__(self, "y", 0.0 if on_y0 else (TAN_PI_8 * x))
         object.__setattr__(self, "rotation", m)
-
-    # --- Static / Class Constructors & Helpers ---
 
     @staticmethod
     def rol(m: int, n: int = 1) -> int:
@@ -373,12 +373,10 @@ class D16Complex:
 
     @classmethod
     def make(cls, x: float, y: float, mask: int) -> D16Complex:
-        """Construct and fold (x, y, mask) into the canonical [0°, 22.5°] wedge."""
         return cls(x, y, mask)
 
     @classmethod
     def reduced(cls, x: float, y: float, counter: int) -> D16Complex:
-        """Construct from already reduced wedge coordinates (x, y) and one-hot counter."""
         if not (_finite_value(x) and _finite_value(y)):
             return cls.nan()
         if x == 0.0 and y == 0.0:
@@ -387,7 +385,6 @@ class D16Complex:
 
     @classmethod
     def from_xy(cls, logic: float, emotion: float, eps: float = 0.0) -> D16Complex:
-        """Encode Cartesian (logic, emotion) into the [0°, 22.5°] wedge and u16 mask."""
         l_val = float(logic)
         e_val = float(emotion)
         if not (_finite_value(l_val) and _finite_value(e_val)):
@@ -398,8 +395,6 @@ class D16Complex:
         if is_z:
             return cls.zero()
         return cls.reduced(x, y, 1 << s16)
-
-    # --- State & Properties ---
 
     def is_zero(self) -> bool:
         return self.rotation == MASK_ZERO
@@ -416,7 +411,6 @@ class D16Complex:
         return self.x * self.x + self.y * self.y
 
     def state(self) -> int:
-        """Return canonical state in 0..15, 16 for Indifferent (0xFFFF), 17 for Undefined (0x0000)."""
         if self.rotation == MASK_ZERO:
             return STATE_INDIFFERENT
         if self.rotation == MASK_NAN:
@@ -429,7 +423,6 @@ class D16Complex:
         return STATE_LABELS[self.state()]
 
     def to_xy(self) -> Tuple[float, float]:
-        """Unfold from the [0°, 22.5°] wedge and u16 mask back to Cartesian (Re, Im)."""
         if self.is_zero():
             return (0.0, 0.0)
         if self.is_nan():
@@ -453,10 +446,7 @@ class D16Complex:
             return (-u, -v)
         return (v, -u)
 
-    # --- Pure Bitwise Dihedral Group Operations (Z_8 |>< Z_2) ---
-
     def apply_group_op(self, op_id: int) -> D16Complex:
-        """Pure bitwise group action of Z_8 |>< Z_2 (op_id in 0..15): (x, y) NEVER changes."""
         if self.is_zero() or self.is_nan():
             return self
         op = op_id & 15
@@ -470,17 +460,12 @@ class D16Complex:
         return obj
 
     def conjugate(self) -> D16Complex:
-        """Complex conjugation (L, E) -> (L, -E) via pure bit reversal of rotation."""
         return self.apply_group_op(8)
 
     def negate(self) -> D16Complex:
-        """Negation (L, E) -> (-L, -E) via 8-bit circular shift of rotation."""
         return self.apply_group_op(4)
 
-    # --- Local Wedge Arithmetic (Multiply, Square, Add) ---
-
     def multiply(self, other: D16Complex) -> D16Complex:
-        """Multiply two D16Complex numbers directly inside the [0°, 22.5°] wedge."""
         if not isinstance(other, D16Complex):
             return NotImplemented
         if self.is_nan() or other.is_nan():
@@ -530,11 +515,9 @@ class D16Complex:
         return self.reduced(out_x, out_y, counter)
 
     def square(self) -> D16Complex:
-        """Square z^2 = z * z inside the [0°, 22.5°] fundamental wedge."""
         return self.multiply(self)
 
     def add(self, other: D16Complex) -> D16Complex:
-        """Add two D16Complex numbers in self's local reference chart without global Re/Im."""
         if not isinstance(other, D16Complex):
             return NotImplemented
         if self.is_nan() or other.is_nan():
@@ -583,7 +566,7 @@ class D16Complex:
 
 
 # =====================================================================
-# 4. VECTORIZED PYTORCH TENSOR ARITHMETIC (D16ComplexTensor & *_u16)
+# 4. VECTORIZED PYTORCH TENSOR ARITHMETIC & AUTOGRAD (D16ComplexTensor)
 # =====================================================================
 
 if _HAS_TORCH:
@@ -864,8 +847,275 @@ if _HAS_TORCH:
         ], dim=-1)
         return torch.where(special.unsqueeze(-1), m.unsqueeze(-1), raw)
 
+    # =====================================================================
+    # 5. ENCAPSULATED LOCAL CHARTS, AUTOGRAD & REAL-AXIS SUBALGEBRA
+    # =====================================================================
+
+    @lru_cache(maxsize=None)
+    def _chart_table(device: torch.device) -> torch.Tensor:
+        """Pack chart turns into bits 0–2 and reflection into bit 3 for every u16 mask."""
+        if device.type != "cpu":
+            return _chart_table(torch.device("cpu")).to(device)
+        charts = []
+        for mask in range(1 << 16):
+            anchor = 0 if mask in (MASK_ZERO, MASK_NAN) else even_anchor(mask)
+            charts.append((((anchor + 1) // 2) & 7) | ((anchor & 1) << 3))
+        return torch.tensor(charts, dtype=torch.uint8, device=device)
+
+    def _chart_parameters(rotation: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Extract 45-degree turn index (0..7) and reflection flag from a 16-bit mask."""
+        chart = _chart_table(rotation.device)[rotation.to(torch.long)]
+        return (chart & 7).long(), (chart & 8) != 0
+
+    def _rotation_basis(turns: torch.Tensor, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        def sine(angle: torch.Tensor) -> torch.Tensor:
+            axis_magnitude = ((angle & 3) == 2).to(dtype=dtype)
+            magnitude = torch.where((angle & 1) != 0, INV_SQRT2, axis_magnitude)
+            return torch.where(angle < 4, magnitude, -magnitude)
+
+        return sine((turns + 2) & 7), sine(turns)
+
+    def _from_chart(
+        x: torch.Tensor, y: torch.Tensor, rotation: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        turns, reflected = _chart_parameters(rotation)
+        cos, sin = _rotation_basis(turns, x.dtype)
+        y_oriented = torch.where(reflected, -y, y)
+        return cos * x - sin * y_oriented, sin * x + cos * y_oriented
+
+    def _into_chart(
+        re: torch.Tensor, im: torch.Tensor, rotation: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        turns, reflected = _chart_parameters(rotation)
+        cos, sin = _rotation_basis(turns, re.dtype)
+        y = cos * im - sin * re
+        return cos * re + sin * im, torch.where(reflected, -y, y)
+
+    def _compose_chart_mask(
+        local_mask: torch.Tensor, turns: torch.Tensor, reflected: torch.Tensor
+    ) -> torch.Tensor:
+        """Compose a local mask with a chart's reflection and 45-degree turns."""
+        relative_mask = torch.where(reflected, reverse_bits_u16(local_mask), local_mask)
+        shift = turns * 2
+        return ((relative_mask << shift) | (relative_mask >> ((-shift) & 15))) & MASK_ZERO
+
+    class _PackComplex(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, re, re_mask, im, im_mask):
+            re_negative = re_mask == REAL_NEGATIVE
+            im_negative = im_mask == REAL_NEGATIVE
+            upper = torch.where(re_negative, 1, 0)
+            lower = torch.where(re_negative, 2, 3)
+            quadrant = torch.where(im_negative, lower, upper)
+            even_quadrant = (quadrant & 1) == 0
+            u = torch.where(even_quadrant, re, im)
+            v = torch.where(even_quadrant, im, re)
+            swapped = v >= u
+            wx = torch.where(swapped, v, u)
+            wy = torch.where(swapped, u, v)
+
+            diagonal = above_bisector_d16(wx, wy)
+            x = torch.where(diagonal, rotated_sum_d16(wx, wy), wx)
+            y = torch.where(diagonal, (wx - wy) * INV_SQRT2, wy)
+            sector = 4 * quadrant + torch.where(
+                diagonal, torch.where(swapped, 2, 1), torch.where(swapped, 3, 0)
+            )
+            x, y, rotation = d16_reduced_u16(x, y, sector, (wx == 0) & (wy == 0))
+            undefined = (re_mask == MASK_NAN) | (im_mask == MASK_NAN)
+            rotation = rotation.masked_fill(undefined, MASK_NAN)
+            ctx.save_for_backward(rotation, re_negative, im_negative)
+            ctx.mark_non_differentiable(rotation)
+            return x.masked_fill(undefined, 0), y.masked_fill(undefined, 0), rotation
+
+        @staticmethod
+        def backward(ctx, grad_x, grad_y, _grad_rotation):
+            rotation, re_negative, im_negative = ctx.saved_tensors
+            grad_re, grad_im = _from_chart(grad_x, grad_y, rotation)
+            undefined = rotation == MASK_NAN
+            grad_re = torch.where(re_negative, -grad_re, grad_re).masked_fill(undefined, 0)
+            grad_im = torch.where(im_negative, -grad_im, grad_im).masked_fill(undefined, 0)
+            return grad_re.sum_to_size(re_negative.shape), None, grad_im.sum_to_size(im_negative.shape), None
+
+    class _MultiplyComplex(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, ax, ay, ar, bx, by, br):
+            zx, zy, zr = d16_multiply_u16(ax, ay, ar, bx, by, br)
+            ctx.save_for_backward(ax, ay, ar, bx, by, br, zr)
+            ctx.mark_non_differentiable(zr)
+            return zx, zy, zr
+
+        @staticmethod
+        def backward(ctx, grad_x, grad_y, _grad_rotation):
+            ax, ay, ar, bx, by, br, rotation = ctx.saved_tensors
+            grad_re, grad_im = _from_chart(grad_x, grad_y, rotation)
+            defined = rotation != MASK_NAN
+
+            def operand_gradient(x, y, mask, other_x, other_y, other_mask):
+                re, im = _from_chart(other_x, other_y, other_mask)
+                local_x, local_y = _into_chart(
+                    grad_re * re + grad_im * im, grad_im * re - grad_re * im, mask
+                )
+                return (
+                    local_x.masked_fill(~defined, 0).sum_to_size(x.shape),
+                    local_y.masked_fill(~defined, 0).sum_to_size(y.shape),
+                )
+
+            grad_ax = grad_ay = grad_bx = grad_by = None
+            if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
+                grad_ax, grad_ay = operand_gradient(ax, ay, ar, bx, by, br)
+            if ctx.needs_input_grad[3] or ctx.needs_input_grad[4]:
+                grad_bx, grad_by = operand_gradient(bx, by, br, ax, ay, ar)
+            return grad_ax, grad_ay, None, grad_bx, grad_by, None
+
+    class _AddComplex(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, ax, ay, ar, bx, by, br):
+            a_turns, a_reflected = _chart_parameters(ar)
+            b_turns, b_reflected = _chart_parameters(br)
+            cos, sin = _rotation_basis((b_turns - a_turns) & 7, bx.dtype)
+            by_oriented = torch.where(b_reflected, -by, by)
+            bx_in_a = cos * bx - sin * by_oriented
+            by_in_a = sin * bx + cos * by_oriented
+            by_in_a = torch.where(a_reflected, -by_in_a, by_in_a)
+            lx, ly, lrot = d16_from_xy_u16(ax + bx_in_a, ay + by_in_a)
+
+            rotation = _compose_chart_mask(lrot, a_turns, a_reflected)
+            rotation = torch.where(ar == MASK_ZERO, br, torch.where(br == MASK_ZERO, ar, rotation))
+            undefined = (ar == MASK_NAN) | (br == MASK_NAN)
+            rotation = rotation.masked_fill(undefined, MASK_NAN)
+            x = torch.where(ar == MASK_ZERO, bx, torch.where(br == MASK_ZERO, ax, lx))
+            y = torch.where(ar == MASK_ZERO, by, torch.where(br == MASK_ZERO, ay, ly))
+
+            ctx.save_for_backward(ar, br, rotation)
+            ctx.mark_non_differentiable(rotation)
+            return x.masked_fill(undefined, 0), y.masked_fill(undefined, 0), rotation
+
+        @staticmethod
+        def backward(ctx, grad_x, grad_y, _grad_rotation):
+            ar, br, rotation = ctx.saved_tensors
+            grad_re, grad_im = _from_chart(grad_x, grad_y, rotation)
+            undefined = rotation == MASK_NAN
+
+            def operand_gradient(mask):
+                local_x, local_y = _into_chart(grad_re, grad_im, mask)
+                return (
+                    local_x.masked_fill(undefined, 0).sum_to_size(mask.shape),
+                    local_y.masked_fill(undefined, 0).sum_to_size(mask.shape),
+                )
+
+            grad_ax = grad_ay = grad_bx = grad_by = None
+            if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
+                grad_ax, grad_ay = operand_gradient(ar)
+            if ctx.needs_input_grad[3] or ctx.needs_input_grad[4]:
+                grad_bx, grad_by = operand_gradient(br)
+            return grad_ax, grad_ay, None, grad_bx, grad_by, None
+
+    def _real_magnitude(
+        magnitude: torch.Tensor,
+        negative: torch.Tensor,
+        undefined: torch.Tensor,
+    ) -> "D16ComplexTensor":
+        undefined = undefined | ~torch.isfinite(magnitude)
+        zero = magnitude == 0
+        negative_mask = torch.full((), REAL_NEGATIVE, device=magnitude.device, dtype=torch.int32)
+        positive_mask = torch.full_like(negative_mask, REAL_POSITIVE)
+        rotation = torch.where(negative, negative_mask, positive_mask)
+        rotation = torch.where(zero, MASK_ZERO, rotation)
+        rotation = torch.where(undefined, MASK_NAN, rotation)
+        x = torch.where(negative & zero, -magnitude, magnitude)
+        x = torch.where(undefined, 0.0, x)
+        return D16ComplexTensor(x, x.new_zeros(()).expand_as(x), rotation)
+
+    def _from_real(value: torch.Tensor) -> "D16ComplexTensor":
+        negative = value < 0
+        magnitude = torch.where(negative, -value, value)
+        return _real_magnitude(magnitude, negative, ~torch.isfinite(value))
+
+    def _real_add(a: "D16ComplexTensor", b: "D16ComplexTensor") -> "D16ComplexTensor":
+        a_negative = a.rotation == REAL_NEGATIVE
+        b_negative = b.rotation == REAL_NEGATIVE
+        same_ray = a_negative == b_negative
+        difference = a.x - b.x
+        flip = difference < 0
+        magnitude = torch.where(same_ray, a.x + b.x, torch.where(flip, -difference, difference))
+        negative = a_negative ^ (~same_ray & flip)
+        return _real_magnitude(magnitude, negative, a.is_nan() | b.is_nan())
+
+    def _real_negate(value: "D16ComplexTensor") -> "D16ComplexTensor":
+        return _real_magnitude(value.x, value.rotation != REAL_NEGATIVE, value.is_nan())
+
+    def _real_multiply(a: "D16ComplexTensor", b: "D16ComplexTensor") -> "D16ComplexTensor":
+        negative = (a.rotation == REAL_NEGATIVE) ^ (b.rotation == REAL_NEGATIVE)
+        return _real_magnitude(a.x * b.x, negative, a.is_nan() | b.is_nan())
+
+    def _real_matmul(a: "D16ComplexTensor", b: "D16ComplexTensor") -> "D16ComplexTensor":
+        dtype = torch.promote_types(a.dtype, b.dtype)
+        accum_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+
+        a_vector = a.x.ndim == 1
+        b_vector = b.x.ndim == 1
+        ax = a.x.unsqueeze(0) if a_vector else a.x
+        am = a.rotation.unsqueeze(0) if a_vector else a.rotation
+        bx = b.x.unsqueeze(1) if b_vector else b.x
+        bm = b.rotation.unsqueeze(1) if b_vector else b.rotation
+
+        a_negative = am == REAL_NEGATIVE
+        b_negative = bm == REAL_NEGATIVE
+        ax, bx = ax.to(accum_dtype), bx.to(accum_dtype)
+        a_pos = torch.where(a_negative, 0.0, ax)
+        a_neg = torch.where(a_negative, ax, 0.0)
+        b_pos = torch.where(b_negative, 0.0, bx)
+        b_neg = torch.where(b_negative, bx, 0.0)
+
+        with torch.autocast(device_type=a.device.type, enabled=False):
+            positive = a_pos @ b_pos + a_neg @ b_neg
+            negative = a_pos @ b_neg + a_neg @ b_pos
+            difference = positive - negative
+
+        undefined = (am == MASK_NAN).any(dim=-1, keepdim=True) | (bm == MASK_NAN).any(dim=-2, keepdim=True)
+        if a_vector:
+            difference = difference.squeeze(-2)
+            undefined = undefined.squeeze(-2)
+        if b_vector:
+            difference = difference.squeeze(-1)
+            undefined = undefined.squeeze(-1)
+
+        on_negative_ray = difference < 0
+        magnitude = torch.where(on_negative_ray, -difference, difference).to(dtype)
+        return _real_magnitude(magnitude, on_negative_ray, undefined)
+
+    def _shifted_exp(value: "D16ComplexTensor", active: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        negative = value.rotation == REAL_NEGATIVE
+        dtype = value.dtype
+        x = value.x.float() if dtype in (torch.float16, torch.bfloat16) else value.x
+        positive_max = torch.where(active & ~negative, x, -float("inf")).amax(dim=-1, keepdim=True)
+        negative_max = -torch.where(active & negative, x, float("inf")).amin(dim=-1, keepdim=True)
+        maximum = torch.maximum(positive_max, negative_max)
+        maximum = torch.where(torch.isfinite(maximum), maximum, 0.0)
+        centered = torch.where(negative, -x - maximum, x - maximum)
+        return maximum, torch.where(active, centered, -float("inf")).exp()
+
+    def _scale_wedge(z: "D16ComplexTensor", scale: Union[float, int, torch.Tensor]) -> "D16ComplexTensor":
+        """Scale a D16ComplexTensor by a real scalar or tensor (handling negative scales via 180° shift)."""
+        if not isinstance(scale, torch.Tensor):
+            scale_t = z.x.new_tensor(scale)
+        else:
+            scale_t = scale.to(device=z.device)
+        neg = scale_t < 0
+        mag = torch.where(neg, -scale_t, scale_t)
+        x = (z.x * mag).to(z.dtype)
+        y = (z.y * mag).to(z.dtype)
+        undefined = z.is_nan() | ~torch.isfinite(scale_t) | ~torch.isfinite(x) | ~torch.isfinite(y)
+        rot = torch.where(neg, apply_group_op_u16(z.rotation, 4), z.rotation)
+        mask = torch.where((x == 0) & (y == 0), MASK_ZERO, rot)
+        return D16ComplexTensor(
+            x.masked_fill(undefined, 0),
+            y.masked_fill(undefined, 0),
+            mask.masked_fill(undefined, MASK_NAN),
+        )
+
     class D16ComplexTensor:
-        """Vectorized PyTorch container of D16Complex objects over arbitrary tensor shapes."""
+        """Vectorized PyTorch container of D16Complex objects with full autograd and operator encapsulation."""
 
         __slots__ = ("x", "y", "rotation")
 
@@ -874,61 +1124,126 @@ if _HAS_TORCH:
             self.y = y
             self.rotation = rotation
 
+        # --- Constructors & Encodings ---
+
+        @classmethod
+        def zeros(
+            cls,
+            shape: Union[int, Sequence[int], torch.Size],
+            *,
+            dtype: torch.dtype = torch.float32,
+            device: Optional[Union[str, torch.device]] = None,
+        ) -> "D16ComplexTensor":
+            if isinstance(shape, int):
+                shape = (shape,)
+            x = torch.zeros(shape, dtype=dtype, device=device)
+            mask = torch.full(shape, MASK_ZERO, dtype=torch.int32, device=x.device)
+            return cls(x, torch.zeros_like(x), mask)
+
+        @classmethod
+        def zeros_like(
+            cls,
+            other: Union["D16ComplexTensor", torch.Tensor],
+            *,
+            dtype: Optional[torch.dtype] = None,
+            device: Optional[Union[str, torch.device]] = None,
+        ) -> "D16ComplexTensor":
+            ref = other.x if isinstance(other, D16ComplexTensor) else other
+            target_dtype = ref.dtype if dtype is None else dtype
+            target_device = ref.device if device is None else device
+            x = torch.zeros_like(ref, dtype=target_dtype, device=target_device)
+            rot_dtype = other.rotation.dtype if isinstance(other, D16ComplexTensor) else torch.int32
+            mask = torch.full_like(ref, MASK_ZERO, dtype=rot_dtype, device=target_device)
+            return cls(x, torch.zeros_like(x), mask)
+
+        @classmethod
+        @torch.no_grad()
+        def random_polar(
+            cls,
+            shape: Sequence[int],
+            std: float = 1.0,
+            *,
+            normal: bool = False,
+            dtype: torch.dtype = torch.float32,
+            device: Optional[Union[str, torch.device]] = None,
+        ) -> "D16ComplexTensor":
+            """Sample an isotropic disk or Gaussian directly in D16 polar coordinates."""
+            sample = torch.rand(shape, dtype=dtype, device=device)
+            if normal:
+                radius = (-2 * sample.clamp_min(torch.finfo(sample.dtype).tiny).log()).sqrt() * std
+            else:
+                radius = sample.sqrt() * (2 * std)
+            angle = torch.rand_like(sample) * (math.pi / 8)
+            sector = torch.randint(16, sample.shape, device=sample.device)
+            x, y, mask = d16_reduced_u16(radius * angle.cos(), radius * angle.sin(), sector, radius == 0)
+            return cls(x, y, mask.to(torch.int32))
+
+        @classmethod
+        def from_real(cls, value: Union[float, int, torch.Tensor]) -> "D16ComplexTensor":
+            if not isinstance(value, torch.Tensor):
+                value = torch.tensor(value)
+            return _from_real(value)
+
+        @classmethod
+        def pack(cls, re: "D16ComplexTensor", im: "D16ComplexTensor") -> "D16ComplexTensor":
+            return cls(*_PackComplex.apply(re.x, re.rotation, im.x, im.rotation))
+
+        @classmethod
+        def encode_coordinates(cls, real: torch.Tensor, imag: torch.Tensor) -> "D16ComplexTensor":
+            return cls.pack(_from_real(real), _from_real(imag))
+
         @classmethod
         def from_xy(
             cls,
-            re: torch.Tensor,
-            im: torch.Tensor,
+            logic: torch.Tensor,
+            emotion: torch.Tensor,
             eps: Union[float, torch.Tensor] = 0.0,
-        ) -> D16ComplexTensor:
-            x, y, rot = d16_from_xy_u16(re, im, eps=eps)
-            return cls(x, y, rot)
+        ) -> "D16ComplexTensor":
+            x, y, m = d16_from_xy_u16(logic, emotion, eps=eps)
+            return cls(x, y, m)
 
         @classmethod
-        def make(cls, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> D16ComplexTensor:
-            rx, ry, rmask = d16_make_u16(x, y, mask)
-            return cls(rx, ry, rmask)
+        def make(cls, x: torch.Tensor, y: torch.Tensor, rotation: torch.Tensor) -> "D16ComplexTensor":
+            rx, ry, rm = d16_make_u16(x, y, rotation)
+            return cls(rx, ry, rm)
+
+        @classmethod
+        def from_local_tangent(
+            cls,
+            grad_x: torch.Tensor,
+            grad_y: torch.Tensor,
+            chart_owner: "D16ComplexTensor",
+        ) -> "D16ComplexTensor":
+            """Construct a canonical D16ComplexTensor from a signed local tangent in chart_owner's chart."""
+            lx, ly, lrot = d16_from_xy_u16(grad_x, grad_y)
+            turns, reflected = _chart_parameters(chart_owner.rotation)
+            rot = _compose_chart_mask(lrot, turns, reflected)
+            is_z = (lrot == MASK_ZERO) | ((lx == 0) & (ly == 0))
+            is_nan = (lrot == MASK_NAN) | chart_owner.is_nan()
+            rot = torch.where(is_z, torch.full_like(rot, MASK_ZERO), rot)
+            rot = torch.where(is_nan, torch.full_like(rot, MASK_NAN), rot)
+            return cls(lx.masked_fill(is_nan, 0.0), ly.masked_fill(is_nan, 0.0), rot)
+
+        # --- Basic Properties & Tensor Utilities ---
 
         @property
         def shape(self) -> torch.Size:
             return self.x.shape
 
         @property
-        def device(self) -> torch.device:
-            return self.x.device
+        def ndim(self) -> int:
+            return self.x.ndim
 
         @property
         def dtype(self) -> torch.dtype:
             return self.x.dtype
 
-        def to(self, *args, **kwargs) -> D16ComplexTensor:
-            nx = self.x.to(*args, **kwargs)
-            ny = self.y.to(*args, **kwargs)
-            nrot = self.rotation.to(device=nx.device)
-            return D16ComplexTensor(nx, ny, nrot)
+        @property
+        def device(self) -> torch.device:
+            return self.x.device
 
-        def detach(self) -> D16ComplexTensor:
-            return D16ComplexTensor(self.x.detach(), self.y.detach(), self.rotation.detach())
-
-        def clone(self) -> D16ComplexTensor:
-            return D16ComplexTensor(self.x.clone(), self.y.clone(), self.rotation.clone())
-
-        def __getitem__(self, item) -> D16ComplexTensor:
-            return D16ComplexTensor(self.x[item], self.y[item], self.rotation[item])
-
-        def to_xy(self) -> Tuple[torch.Tensor, torch.Tensor]:
-            return d16_to_xy_u16(self.x, self.y, self.rotation)
-
-        def real(self) -> torch.Tensor:
-            re, _ = self.to_xy()
-            return re
-
-        def imag(self) -> torch.Tensor:
-            _, im = self.to_xy()
-            return im
-
-        def state(self) -> torch.Tensor:
-            return state_u16(self.rotation)
+        def numel(self) -> int:
+            return self.x.numel()
 
         def is_zero(self) -> torch.Tensor:
             return self.rotation == MASK_ZERO
@@ -936,48 +1251,214 @@ if _HAS_TORCH:
         def is_nan(self) -> torch.Tensor:
             return self.rotation == MASK_NAN
 
+        def is_negative_real(self) -> torch.Tensor:
+            return self.rotation == REAL_NEGATIVE
+
+        def state(self) -> torch.Tensor:
+            return state_u16(self.rotation)
+
         def norm_squared(self) -> torch.Tensor:
-            return self.x.square() + self.y.square()
+            return self.x * self.x + self.y * self.y
 
-        def abs(self) -> torch.Tensor:
-            return torch.hypot(self.x, self.y)
+        def norm_squared_d16(self) -> "D16ComplexTensor":
+            ns = self.norm_squared().masked_fill(self.is_nan(), float("nan"))
+            return _from_real(ns)
 
-        def multiply(self, other: D16ComplexTensor) -> D16ComplexTensor:
-            nx, ny, nrot = d16_multiply_u16(
-                self.x, self.y, self.rotation,
-                other.x, other.y, other.rotation,
+        def to_xy(self) -> Tuple[torch.Tensor, torch.Tensor]:
+            return d16_to_xy_u16(self.x, self.y, self.rotation)
+
+        def unpack(self) -> Tuple["D16ComplexTensor", "D16ComplexTensor"]:
+            re, im = _from_chart(self.x, self.y, self.rotation)
+            undefined = self.is_nan()
+            return (
+                _from_real(re.masked_fill(undefined, float("nan"))),
+                _from_real(im.masked_fill(undefined, float("nan"))),
             )
+
+        def real_signed(self) -> torch.Tensor:
+            """Extract signed scalar tensor for a real-axis D16ComplexTensor."""
+            val = torch.where(self.rotation == REAL_NEGATIVE, -self.x, self.x)
+            return val.masked_fill(self.is_nan(), float("nan"))
+
+        def to(self, *args, **kwargs) -> "D16ComplexTensor":
+            nx = self.x.to(*args, **kwargs)
+            ny = self.y.to(*args, **kwargs)
+            nrot = self.rotation.to(device=nx.device)
+            undefined = self.is_nan() | ~torch.isfinite(nx) | ~torch.isfinite(ny)
+            if bool(undefined.any()):
+                nx = nx.masked_fill(undefined, 0.0)
+                ny = ny.masked_fill(undefined, 0.0)
+                nrot = nrot.masked_fill(undefined, MASK_NAN)
             return D16ComplexTensor(nx, ny, nrot)
 
-        def square(self) -> D16ComplexTensor:
-            return self.multiply(self)
+        def round_to_dtype(self, dtype: torch.dtype) -> "D16ComplexTensor":
+            if self.dtype == dtype:
+                return self
+            nx, ny = self.x.to(dtype), self.y.to(dtype)
+            undefined = self.is_nan() | ~torch.isfinite(nx) | ~torch.isfinite(ny)
+            return D16ComplexTensor.make(
+                nx.masked_fill(undefined, 0.0),
+                ny.masked_fill(undefined, 0.0),
+                self.rotation.masked_fill(undefined, MASK_NAN),
+            )
 
-        def apply_group_op(self, op_id: int) -> D16ComplexTensor:
-            """Pure bitwise Z_8 |>< Z_2 action on rotation mask; (x, y) is untouched."""
+        def clone(self) -> "D16ComplexTensor":
+            return D16ComplexTensor(self.x.clone(), self.y.clone(), self.rotation.clone())
+
+        def detach(self) -> "D16ComplexTensor":
+            return D16ComplexTensor(self.x.detach(), self.y.detach(), self.rotation.detach())
+
+        def __getitem__(self, index) -> "D16ComplexTensor":
+            return D16ComplexTensor(self.x[index], self.y[index], self.rotation[index])
+
+        def copy_slice_(self, index, value: "D16ComplexTensor") -> "D16ComplexTensor":
+            self.x[index].copy_(value.x)
+            self.y[index].copy_(value.y)
+            self.rotation[index].copy_(value.rotation)
+            return self
+
+        def map_tensors(self, op: Callable[[torch.Tensor], torch.Tensor]) -> "D16ComplexTensor":
+            return D16ComplexTensor(op(self.x), op(self.y), op(self.rotation))
+
+        def split(self, split_size: int, dim: int = 0) -> Tuple["D16ComplexTensor", ...]:
+            return tuple(
+                D16ComplexTensor(tx, ty, tr)
+                for tx, ty, tr in zip(
+                    self.x.split(split_size, dim=dim),
+                    self.y.split(split_size, dim=dim),
+                    self.rotation.split(split_size, dim=dim),
+                )
+            )
+
+        @staticmethod
+        def cat(tensors: Sequence["D16ComplexTensor"], dim: int = 0) -> "D16ComplexTensor":
+            return D16ComplexTensor(
+                torch.cat([t.x for t in tensors], dim=dim),
+                torch.cat([t.y for t in tensors], dim=dim),
+                torch.cat([t.rotation for t in tensors], dim=dim),
+            )
+
+        def to_indifferent_where(self, cond: torch.Tensor) -> "D16ComplexTensor":
+            z_x = torch.where(cond, torch.zeros_like(self.x), self.x)
+            z_y = torch.where(cond, torch.zeros_like(self.y), self.y)
+            z_m = torch.where(cond, torch.full_like(self.rotation, MASK_ZERO), self.rotation)
+            return D16ComplexTensor(z_x, z_y, z_m)
+
+        def apply_Manifold_Threshold_L1(self, eps: Union[float, torch.Tensor]) -> "D16ComplexTensor":
+            re, im = self.unpack()
+            return self.to_indifferent_where((re.x + im.x) <= eps)
+
+        # --- Dihedral & Algebraic Operations (Autograd-Enabled) ---
+
+        def apply_group_op(self, op_id: int) -> "D16ComplexTensor":
             return D16ComplexTensor(self.x, self.y, apply_group_op_u16(self.rotation, op_id))
 
-        def all_16_group_masks(self) -> torch.Tensor:
-            return apply_all_16_d16_ops_u16(self.rotation)
-
-        def conjugate(self) -> D16ComplexTensor:
+        def conjugate(self) -> "D16ComplexTensor":
             return self.apply_group_op(8)
 
-        def negate(self) -> D16ComplexTensor:
+        def negate(self) -> "D16ComplexTensor":
             return self.apply_group_op(4)
 
-        def to_indifferent_where(self, cond: torch.Tensor) -> D16ComplexTensor:
-            """Set mask to 0xFFFF (State 16: Indifferent) where cond is True."""
-            valid_cond = cond & (self.rotation != MASK_NAN)
-            new_rot = torch.where(valid_cond, torch.full_like(self.rotation, MASK_ZERO), self.rotation)
-            new_x = torch.where(valid_cond, torch.zeros_like(self.x), self.x)
-            new_y = torch.where(valid_cond, torch.zeros_like(self.y), self.y)
-            return D16ComplexTensor(new_x, new_y, new_rot)
+        def scale(self, factor: Union[float, int, torch.Tensor]) -> "D16ComplexTensor":
+            return _scale_wedge(self, factor)
 
-        def __mul__(self, other: D16ComplexTensor) -> D16ComplexTensor:
+        def add(self, other: "D16ComplexTensor") -> "D16ComplexTensor":
+            if not isinstance(other, D16ComplexTensor):
+                return NotImplemented
+            return D16ComplexTensor(*_AddComplex.apply(self.x, self.y, self.rotation, other.x, other.y, other.rotation))
+
+        def multiply(self, other: Union["D16ComplexTensor", float, int, torch.Tensor]) -> "D16ComplexTensor":
+            if isinstance(other, D16ComplexTensor):
+                return D16ComplexTensor(
+                    *_MultiplyComplex.apply(self.x, self.y, self.rotation, other.x, other.y, other.rotation)
+                )
+            if isinstance(other, (int, float, torch.Tensor)):
+                return _scale_wedge(self, other)
+            return NotImplemented
+
+        def square(self) -> "D16ComplexTensor":
+            return self.multiply(self)
+
+        def __add__(self, other: "D16ComplexTensor") -> "D16ComplexTensor":
+            return self.add(other)
+
+        def __sub__(self, other: "D16ComplexTensor") -> "D16ComplexTensor":
+            if not isinstance(other, D16ComplexTensor):
+                return NotImplemented
+            return self.add(other.negate())
+
+        def __mul__(self, other: Union["D16ComplexTensor", float, int, torch.Tensor]) -> "D16ComplexTensor":
             return self.multiply(other)
 
-        def __neg__(self) -> D16ComplexTensor:
+        def __rmul__(self, other: Union[float, int, torch.Tensor]) -> "D16ComplexTensor":
+            if isinstance(other, (int, float, torch.Tensor)):
+                return _scale_wedge(self, other)
+            return NotImplemented
+
+        def __neg__(self) -> "D16ComplexTensor":
             return self.negate()
+
+        # --- Real-Axis Subalgebra Operations (Scores, Softmax, Loss, Linear Contractions) ---
+
+        def real_add(self, other: "D16ComplexTensor") -> "D16ComplexTensor":
+            return _real_add(self, other)
+
+        def real_sub(self, other: "D16ComplexTensor") -> "D16ComplexTensor":
+            return _real_add(self, _real_negate(other))
+
+        def real_negate(self) -> "D16ComplexTensor":
+            return _real_negate(self)
+
+        def real_multiply(self, other: "D16ComplexTensor") -> "D16ComplexTensor":
+            return _real_multiply(self, other)
+
+        def real_matmul(self, other: "D16ComplexTensor") -> "D16ComplexTensor":
+            return _real_matmul(self, other)
+
+        def real_sigmoid(self) -> "D16ComplexTensor":
+            negative = self.rotation == REAL_NEGATIVE
+            exp = (-self.x).exp()
+            one = torch.ones_like(exp)
+            probability = torch.where(negative, exp, one) / (one + exp)
+            return _real_magnitude(probability, torch.zeros_like(negative), self.is_nan())
+
+        def real_softmax(self, allowed: Optional[torch.Tensor] = None) -> "D16ComplexTensor":
+            if self.shape[-1] == 0:
+                return self
+            undefined = self.is_nan()
+            active = ~undefined if allowed is None else allowed & ~undefined
+            if allowed is not None:
+                undefined = undefined & allowed
+            _, terms = _shifted_exp(self, active)
+            probabilities = (terms / terms.sum(dim=-1, keepdim=True).clamp_min(1)).to(self.dtype)
+            return _real_magnitude(probabilities, torch.zeros_like(undefined), undefined.any(dim=-1, keepdim=True))
+
+        def real_argmax(self) -> torch.Tensor:
+            negative = self.rotation == REAL_NEGATIVE
+            nonnegative = ~negative & ~self.is_nan()
+            positive_max, positive_address = self.x.masked_fill(~nonnegative, -torch.inf).max(-1, keepdim=True)
+            negative_min, negative_address = self.x.masked_fill(~negative, torch.inf).min(-1, keepdim=True)
+            first = torch.where(positive_max.isfinite(), positive_address, negative_address)
+            if bool((~positive_max.isfinite() & ~negative_min.isfinite()).any()):
+                raise ValueError("Cannot select a token from undefined logits")
+            return first
+
+        def real_cross_entropy(self, targets: torch.Tensor) -> "D16ComplexTensor":
+            scores = self.to(torch.float32) if self.dtype in (torch.float16, torch.bfloat16) else self
+            valid = targets != -100
+            addresses = targets.masked_fill(~valid, 0).unsqueeze(-1)
+            selected = scores.map_tensors(lambda t: t.gather(-1, addresses).squeeze(-1))
+            undefined = scores.is_nan()
+            maximum, terms = _shifted_exp(scores, ~undefined)
+            distance = _from_real(maximum.squeeze(-1)).real_sub(selected)
+            losses = distance.real_add(_from_real(terms.sum(dim=-1).log()))
+            negative = losses.rotation == REAL_NEGATIVE
+            total = (
+                losses.x.masked_fill(~valid | negative, 0).sum()
+                - losses.x.masked_fill(~valid | ~negative, 0).sum()
+            )
+            mean = (total / valid.sum()).masked_fill((undefined.any(dim=-1) & valid).any(), float("nan"))
+            return _from_real(mean)
 
         def __repr__(self) -> str:
             return f"D16ComplexTensor(shape={tuple(self.shape)}, dtype={self.dtype}, device={self.device})"
@@ -990,6 +1471,8 @@ __all__ = [
     "EPS_BOUND",
     "MASK_ZERO",
     "MASK_NAN",
+    "REAL_POSITIVE",
+    "REAL_NEGATIVE",
     "STATE_INDIFFERENT",
     "STATE_UNDEFINED",
     "STATE_LABELS",
