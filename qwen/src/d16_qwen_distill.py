@@ -14,6 +14,8 @@ import torch
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
+from d16_adamw import D16AdamW
+from d16_parameter import D16Parameter
 from d16_qwen_model2 import (
     D16ComplexTensor,
     D16QwenConfig,
@@ -30,6 +32,7 @@ from d16_qwen_model2 import (
 from d16_qwen_training_state import (
     TrainingState,
     load_training_checkpoint,
+    read_training_metadata,
     save_inference_checkpoint,
     save_training_checkpoint,
 )
@@ -85,6 +88,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-every", type=int, default=100, help="Save resumable state every N updates")
     parser.add_argument("--evaluate-every", type=int, default=500, help="Validate every N updates and at each epoch end")
     parser.add_argument("--resume", action="store_true", help="Restore an existing run from latest.pt")
+    parser.add_argument("--weight-storage", choices=("d16", "cartesian"),
+                        help="New runs default to D16; resumes use their recorded format")
     parser.add_argument("--stop-after-step", type=int, help="Save and pause after this absolute optimizer step")
     parser.add_argument("--tf32", action="store_true", help="Permit TF32 for FP32 coordinate matrix products on CUDA")
     args = parser.parse_args()
@@ -195,8 +200,11 @@ def _update(student, teacher, optimizer, ids, args) -> tuple[dict[str, float], i
     if bool(objective.is_nan()) or not all(math.isfinite(value) for value in values):
         raise RuntimeError("Undefined loss")
     objective.x.backward()
-    grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0, error_if_nonfinite=True)
-    optimizer.step()
+    if isinstance(optimizer, D16AdamW):
+        grad_norm = optimizer.step(max_grad_norm=1.0)
+    else:
+        grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0, error_if_nonfinite=True)
+        optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     return {
         "student_nll": values[0],
@@ -206,12 +214,13 @@ def _update(student, teacher, optimizer, ids, args) -> tuple[dict[str, float], i
     }, ids.shape[0] * (ids.shape[1] - 1)
 
 
-def _validate_and_save_best(student, teacher, validation_blocks, args, device, state, config):
+def _validate_and_save_best(student, teacher, validation_blocks, args, device, state, metadata):
     metrics = evaluate(student, teacher, validation_blocks, args, device)
     if state.best_validation is None or metrics["student_nll"] < state.best_validation["student_nll"]:
         save_inference_checkpoint(
-            args.output_dir / "best.pt", student, config=config, epoch=state.epoch,
+            args.output_dir / "best.pt", student, config=metadata["config"], epoch=state.epoch,
             step=state.step, validation=metrics, teacher_revision=args.teacher_revision,
+            weight_storage=metadata["weight_storage"],
         )
         state.best_epoch = state.epoch
         state.best_validation = metrics
@@ -233,6 +242,13 @@ def train(args):
     latest = args.output_dir / "latest.pt"
     if args.resume and not latest.is_file():
         raise FileNotFoundError(f"Missing resumable checkpoint {latest}")
+    resume_metadata = read_training_metadata(latest) if args.resume else None
+    if resume_metadata is None:
+        weight_storage = args.weight_storage or "d16"
+    else:
+        weight_storage = resume_metadata.get("weight_storage", "cartesian")
+        if args.weight_storage is not None and args.weight_storage != weight_storage:
+            raise ValueError(f"The saved run uses weight storage {weight_storage!r}")
 
     with log_path.open("a" if args.resume else "x", encoding="utf-8") as log:
         write_event(
@@ -250,9 +266,13 @@ def train(args):
         ).to(device).eval().requires_grad_(False)
 
         config = student_config(teacher.config)
-        student = D16QwenForCausalLM(config).to(device)
+        student = D16QwenForCausalLM(config, weight_storage=weight_storage).to(device)
         student.gradient_checkpointing_enable()
-        optimizer = torch.optim.AdamW(student.parameters(), lr=args.learning_rate, fused=device.type == "cuda")
+        if weight_storage == "d16":
+            native_parameters = (module for module in student.modules() if isinstance(module, D16Parameter))
+            optimizer = D16AdamW(native_parameters, lr=args.learning_rate)
+        else:
+            optimizer = torch.optim.AdamW(student.parameters(), lr=args.learning_rate, fused=device.type == "cuda")
         train_blocks, train_hash = sample_blocks(
             args.train_text, tokenizer, args.train_blocks, args.sequence_length, args.seed,
         )
@@ -261,6 +281,7 @@ def train(args):
         )
         metadata = {
             "config": asdict(config),
+            "weight_storage": weight_storage,
             "teacher_revision": args.teacher_revision,
             "teacher_dtype": str(teacher_dtype),
             "train_sha256": train_hash,
@@ -283,7 +304,10 @@ def train(args):
         )
 
         if args.resume:
-            state = load_training_checkpoint(latest, student, optimizer, metadata)
+            expected_metadata = metadata.copy()
+            if "weight_storage" not in resume_metadata:
+                del expected_metadata["weight_storage"]
+            state = load_training_checkpoint(latest, student, optimizer, expected_metadata)
             if state.batch > steps_per_epoch or state.step != (state.epoch - 1) * steps_per_epoch + state.batch:
                 raise ValueError("Checkpoint cursor does not match this dataset")
             write_event(log, "resume", epoch=state.epoch, batch=state.batch, step=state.step)
@@ -319,7 +343,7 @@ def train(args):
                     break
                 if state.step % args.evaluate_every == 0:
                     validation = _validate_and_save_best(
-                        student, teacher, validation_blocks, args, device, state, metadata["config"],
+                        student, teacher, validation_blocks, args, device, state, metadata,
                     )
                     write_event(log, "validation", epoch=state.epoch, step=state.step, validation=validation)
                     student.train()
@@ -328,7 +352,7 @@ def train(args):
                     write_event(log, "checkpoint", epoch=state.epoch, batch=state.batch, step=state.step)
 
             validation = _validate_and_save_best(
-                student, teacher, validation_blocks, args, device, state, metadata["config"],
+                student, teacher, validation_blocks, args, device, state, metadata,
             )
             training = {key: total / state.tokens for key, total in state.totals.items()}
             training["student_perplexity"] = math.exp(training["student_nll"])

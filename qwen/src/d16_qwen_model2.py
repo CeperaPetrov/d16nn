@@ -6,10 +6,10 @@ convert tokenizer output. A learned complex embedding maps each token to the
 hidden width. Hidden states, KV cache, logits and generated IDs stay in D16.
 Token selection and cross-entropy use the real-axis component in D16.
 
-Complex parameters have two trainable PyTorch master coordinates. Embedding
-lookup and linear kernels encode the selected parameters as D16 values for
-the calculation. PyTorch supplies kernels for the wedge coordinates and masks.
-This architecture uses its own checkpoints.
+Complex parameters store two trainable wedge coordinates and a persistent
+sector mask. Embedding lookup and linear kernels consume these triples.
+PyTorch supplies kernels for the wedge coordinates and masks. Select
+weight_storage="cartesian" to load checkpoints from the earlier weight layout.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from itertools import repeat
 import math
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
 import torch
 from torch import nn
@@ -34,6 +34,7 @@ from d16_complex import (
     reverse_bits_u16,
     rotated_sum_d16,
 )
+from d16_parameter import D16Parameter
 from d16_qwen_model import (
     D16QwenConfig as _QwenConfig,
     D16QwenForCausalLM as _QwenControls,
@@ -45,6 +46,14 @@ from d16_qwen_model import (
 # canonical boundary masks. Maxima and probabilities are defined on this line.
 _REAL_POSITIVE = 0x8001
 _REAL_NEGATIVE = 0x0180
+
+WeightStorage = Literal["d16", "cartesian"]
+
+
+def _stores_d16(weight_storage: WeightStorage) -> bool:
+    if weight_storage not in ("d16", "cartesian"):
+        raise ValueError(f"Unknown weight storage: {weight_storage!r}")
+    return weight_storage == "d16"
 
 
 def _real_magnitude(
@@ -453,27 +462,70 @@ def _encode_coordinates(real: torch.Tensor, imag: torch.Tensor) -> D16ComplexTen
     return _pack_complex(_from_real(real), _from_real(imag))
 
 
+def _split_d16(value: D16ComplexTensor, tile_size: int):
+    return (D16ComplexTensor(*tile) for tile in zip(
+        value.x.split(tile_size), value.y.split(tile_size), value.rotation.split(tile_size),
+    ))
+
+
 class D16Linear(nn.Module):
     """Complex-linear projection of D16 activations by learned D16 weights."""
 
     # Limit transient wedge storage for large weight matrices, including the LM head.
     _MAX_WEIGHT_TILE = 1 << 20
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = True) -> None:
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        *,
+        weight_storage: WeightStorage = "d16",
+        _shared_weight: Optional[D16Parameter] = None,
+    ) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.gradient_checkpointing = False
+        self._native_weights = _stores_d16(weight_storage)
         shape = (out_features, in_features)
-        self.weight_real = nn.Parameter(torch.empty(shape))
-        self.weight_imag = nn.Parameter(torch.empty(shape))
-        self.bias_real = nn.Parameter(torch.zeros(out_features)) if bias else None
-        self.bias_imag = nn.Parameter(torch.zeros(out_features)) if bias else None
         bound = 1 / math.sqrt(2 * in_features)
-        nn.init.uniform_(self.weight_real, -bound, bound)
-        nn.init.uniform_(self.weight_imag, -bound, bound)
+        if self._native_weights:
+            self.weight = (
+                _shared_weight if _shared_weight is not None
+                else D16Parameter.random_matrix(shape, std=bound / math.sqrt(3), normal=False)
+            )
+            self.bias = D16Parameter.zeros((out_features,)) if bias else None
+        else:
+            self.weight_real = nn.Parameter(torch.empty(shape))
+            self.weight_imag = nn.Parameter(torch.empty(shape))
+            self.bias_real = nn.Parameter(torch.zeros(out_features)) if bias else None
+            self.bias_imag = nn.Parameter(torch.zeros(out_features)) if bias else None
+            nn.init.uniform_(self.weight_real, -bound, bound)
+            nn.init.uniform_(self.weight_imag, -bound, bound)
 
     def _project_tile(
+        self,
+        re: D16ComplexTensor,
+        im: D16ComplexTensor,
+        weight: D16ComplexTensor,
+        bias: Optional[D16ComplexTensor],
+        dtype: torch.dtype,
+        eps: float,
+    ) -> D16ComplexTensor:
+        wr, wi = _unpack_complex(_map_d16(weight, lambda t: t.transpose(0, 1)).to(re.dtype))
+        # The Hamilton product is evaluated with four real-axis D16 contractions.
+        out_re = _real_add(_real_matmul(re, wr), _real_negate(_real_matmul(im, wi)))
+        out_im = _real_add(_real_matmul(re, wi), _real_matmul(im, wr))
+        z = _pack_complex(out_re, out_im)
+        if bias is not None:
+            z = _complex_add(z, bias.to(re.dtype))
+        if eps > 0:
+            zr, zi = _unpack_complex(z)
+            z = z.to_indifferent_where((zr.x + zi.x) <= eps)
+        return z.to(dtype)
+
+    def _project_cartesian_tile(
         self,
         re: D16ComplexTensor,
         im: D16ComplexTensor,
@@ -484,39 +536,36 @@ class D16Linear(nn.Module):
         dtype: torch.dtype,
         eps: float,
     ) -> D16ComplexTensor:
-        weight = _encode_coordinates(weight_real.transpose(0, 1).to(re.dtype), weight_imag.transpose(0, 1).to(re.dtype))
-        wr, wi = _unpack_complex(weight)
-        # The Hamilton product is evaluated with four real-axis D16 contractions.
-        out_re = _real_add(_real_matmul(re, wr), _real_negate(_real_matmul(im, wi)))
-        out_im = _real_add(_real_matmul(re, wi), _real_matmul(im, wr))
-        z = _pack_complex(out_re, out_im)
-        if bias_real is not None and bias_imag is not None:
-            bias = _encode_coordinates(bias_real.to(re.dtype), bias_imag.to(re.dtype))
-            z = _complex_add(z, bias)
-        if eps > 0:
-            zr, zi = _unpack_complex(z)
-            z = z.to_indifferent_where((zr.x + zi.x) <= eps)
-        return z.to(dtype)
+        weight = _encode_coordinates(weight_real.to(re.dtype), weight_imag.to(re.dtype))
+        bias = None if bias_real is None else _encode_coordinates(bias_real.to(re.dtype), bias_imag.to(re.dtype))
+        return self._project_tile(re, im, weight, bias, dtype, eps)
 
     def forward(self, hidden_states: D16ComplexTensor, *, eps: float = 0.0) -> D16ComplexTensor:
         re, im = _unpack_complex(hidden_states)
-        dtype = torch.promote_types(hidden_states.dtype, self.weight_real.dtype)
+        weight_dtype = self.weight.x.dtype if self._native_weights else self.weight_real.dtype
+        dtype = torch.promote_types(hidden_states.dtype, weight_dtype)
         calc_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
         re, im = re.to(calc_dtype), im.to(calc_dtype)
 
         tiles = []
         tile_size = max(1, self._MAX_WEIGHT_TILE // self.in_features)
-        bias_real = self.bias_real.split(tile_size) if self.bias_real is not None else repeat(None)
-        bias_imag = self.bias_imag.split(tile_size) if self.bias_imag is not None else repeat(None)
         # One split per parameter combines the tile gradients in a single backward step.
-        weight_tiles = zip(self.weight_real.split(tile_size), self.weight_imag.split(tile_size), bias_real, bias_imag)
+        if self._native_weights:
+            project = self._project_tile
+            bias_tiles = _split_d16(self.bias.value(), tile_size) if self.bias is not None else repeat(None)
+            parameter_tiles = zip(_split_d16(self.weight.value(), tile_size), bias_tiles)
+        else:
+            project = self._project_cartesian_tile
+            bias_real = self.bias_real.split(tile_size) if self.bias_real is not None else repeat(None)
+            bias_imag = self.bias_imag.split(tile_size) if self.bias_imag is not None else repeat(None)
+            parameter_tiles = zip(self.weight_real.split(tile_size), self.weight_imag.split(tile_size), bias_real, bias_imag)
         recompute = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
-        for wr, wi, br, bi in weight_tiles:
+        for parameter_tile in parameter_tiles:
+            args = (re, im, *parameter_tile, dtype, eps)
             if recompute:
-                z = checkpoint(self._project_tile, re, im, wr, wi, br, bi, dtype, eps,
-                               use_reentrant=False, preserve_rng_state=False)
+                z = checkpoint(project, *args, use_reentrant=False, preserve_rng_state=False)
             else:
-                z = self._project_tile(re, im, wr, wi, br, bi, dtype, eps)
+                z = project(*args)
             tiles.append(z)
 
         if len(tiles) == 1:
@@ -531,19 +580,26 @@ class D16Linear(nn.Module):
 class D16Embedding(nn.Module):
     """Look up learned complex vectors by exact D16 token keys."""
 
-    def __init__(self, vocab_size: int, hidden_size: int) -> None:
+    def __init__(self, vocab_size: int, hidden_size: int, *, weight_storage: WeightStorage = "d16") -> None:
         super().__init__()
         self.register_buffer("_key_numbers", torch.arange(vocab_size), persistent=False)
-        self.weight_real = nn.Parameter(torch.empty(vocab_size, hidden_size))
-        self.weight_imag = nn.Parameter(torch.empty(vocab_size, hidden_size))
-        nn.init.normal_(self.weight_real, std=0.02)
-        nn.init.normal_(self.weight_imag, std=0.02)
+        self._native_weights = _stores_d16(weight_storage)
+        shape = (vocab_size, hidden_size)
+        if self._native_weights:
+            self.weight = D16Parameter.random_matrix(shape, std=0.02, normal=True)
+        else:
+            self.weight_real = nn.Parameter(torch.empty(shape))
+            self.weight_imag = nn.Parameter(torch.empty(shape))
+            nn.init.normal_(self.weight_real, std=0.02)
+            nn.init.normal_(self.weight_imag, std=0.02)
 
     def token_keys(self) -> D16ComplexTensor:
         return encode_token_ids(self._key_numbers.unsqueeze(0))[0]
 
     def forward(self, input_ids: D16ComplexTensor) -> D16ComplexTensor:
         addresses = _token_addresses(input_ids, self.token_keys())
+        if self._native_weights:
+            return self.weight.value()[addresses]
         re = self.weight_real[addresses]
         im = self.weight_imag[addresses]
         return _encode_coordinates(re, im)
@@ -552,9 +608,13 @@ class D16Embedding(nn.Module):
 class D16RMSNorm(nn.Module):
     """RMS normalization by wedge radius with a learnable positive gain."""
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size: int, eps: float = 1e-6, *, weight_storage: WeightStorage = "d16") -> None:
         super().__init__()
-        self.log_gain = nn.Parameter(torch.zeros(hidden_size))
+        self._native_weights = _stores_d16(weight_storage)
+        if self._native_weights:
+            self.gain = D16Parameter.zeros((hidden_size,), real_only=True)
+        else:
+            self.log_gain = nn.Parameter(torch.zeros(hidden_size))
         self.eps = eps
 
     def forward(self, hidden_states: D16ComplexTensor) -> D16ComplexTensor:
@@ -562,7 +622,14 @@ class D16RMSNorm(nn.Module):
         x, y = hidden_states.x.to(dtype), hidden_states.y.to(dtype)
         mean_square = (x.square() + y.square()).mean(dim=-1, keepdim=True)
         undefined = hidden_states.is_nan().any(dim=-1, keepdim=True)
-        scale = (mean_square + self.eps).rsqrt() * self.log_gain.to(dtype).exp()
+        if self._native_weights:
+            # Exponentiate the real-axis D16 log gain using its magnitude and ray.
+            log_gain, _ = _unpack_complex(self.gain.value().to(dtype))
+            gain = torch.where(log_gain.rotation == _REAL_NEGATIVE, -log_gain.x, log_gain.x).exp()
+            gain = gain.masked_fill(log_gain.is_nan(), torch.nan)
+        else:
+            gain = self.log_gain.to(dtype).exp()
+        scale = (mean_square + self.eps).rsqrt() * gain
         return _scale_wedge(hidden_states, scale.masked_fill(undefined, torch.nan))
 
 

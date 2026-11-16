@@ -5,9 +5,16 @@ from dataclasses import asdict, dataclass, field
 import os
 from pathlib import Path
 import tempfile
+from typing import Protocol
 
 import torch
 from torch import nn
+
+
+class CheckpointOptimizer(Protocol):
+    def state_dict(self) -> dict: ...
+
+    def load_state_dict(self, state: dict) -> None: ...
 
 
 @dataclass
@@ -50,7 +57,7 @@ def _atomic_save(path: Path, payload: dict) -> None:
 def save_training_checkpoint(
     path: Path,
     model: nn.Module,
-    optimizer: torch.optim.Optimizer,
+    optimizer: CheckpointOptimizer,
     state: TrainingState,
     metadata: dict,
 ) -> None:
@@ -68,10 +75,18 @@ def save_training_checkpoint(
     })
 
 
+def read_training_metadata(path: Path) -> dict:
+    """Identify the storage and optimizer before constructing the model."""
+    payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    if payload.get("format_version") != 1:
+        raise ValueError(f"Unsupported training checkpoint format in {path}")
+    return payload["metadata"]
+
+
 def load_training_checkpoint(
     path: Path,
     model: nn.Module,
-    optimizer: torch.optim.Optimizer,
+    optimizer: CheckpointOptimizer,
     expected_metadata: dict,
 ) -> TrainingState:
     """Restore the run after validating its requested configuration and data."""
@@ -104,8 +119,9 @@ def save_inference_checkpoint(
     step: int,
     validation: dict[str, float | int],
     teacher_revision: str | None = None,
+    weight_storage: str = "cartesian",
 ) -> None:
-    """Save weights and metrics in the same format as the pilot checkpoint."""
+    """Save weights, storage format, and validation metrics."""
     _atomic_save(path, {
         "config": config,
         "state_dict": model.state_dict(),
@@ -113,4 +129,5 @@ def save_inference_checkpoint(
         "step": step,
         "validation": validation,
         "teacher_revision": teacher_revision,
+        "weight_storage": weight_storage,
     })
