@@ -111,7 +111,7 @@ def _apply_sector_steering(
     shift: int = 0,
     channels: Optional[torch.Tensor] = None,
 ) -> D16ComplexTensor:
-    """Modify only the 16-bit sector mask while keeping (x, y) in [0°, 22.5°] untouched."""
+    """Apply mask-based steering; Indifferent also resets the wedge coordinates."""
     rot = z.rotation.clone()
     target = rot[..., -1, channels] if channels is not None else rot
 
@@ -147,7 +147,10 @@ def _apply_sector_steering(
     else:
         rot = updated
 
-    return D16ComplexTensor(z.x, z.y, rot)
+    result = D16ComplexTensor(z.x, z.y, rot)
+    if mode == "active_to_indifferent":
+        return result.to_indifferent_where(rot == MASK_ZERO)
+    return result
 
 
 # =====================================================================

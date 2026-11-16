@@ -23,7 +23,10 @@ for _candidate in (
 import torch
 import torch.nn.functional as F
 
+from d16_complex import D16ComplexTensor, MASK_ZERO
+
 from d16_qwen_model import (
+    _apply_sector_steering,
     D16QwenConfig,
     D16QwenForCausalLM,
     D16QwenMLP,
@@ -85,6 +88,55 @@ class TestD16QwenComponents(unittest.TestCase):
         self.assertIsNotNone(mlp.up_proj.weight.grad)
         self.assertIsNotNone(mlp.gate_proj.weight.grad)
         self.assertIsNotNone(mlp.down_proj.weight.grad)
+
+    def test_diagonal_response_survives_input_threshold(self) -> None:
+        # In D16 the folded y is zero at L=E=-1, but SwiGLU is nonzero.
+        for dtype in (torch.float32, torch.float64):
+            with self.subTest(dtype=dtype), torch.no_grad():
+                cfg = D16QwenConfig.tiny_test_config(
+                    hidden_size=8, intermediate_size=1, indiff_eps=0.01)
+                mlp = D16QwenMLP(cfg).to(dtype=dtype)
+                mlp.up_proj.weight.zero_()
+                mlp.gate_proj.weight.zero_()
+                mlp.down_proj.weight.zero_()
+                mlp.up_proj.weight[0, 0] = 1.
+                mlp.gate_proj.weight[0, 1] = 1.
+                mlp.down_proj.weight[0, 0] = 1.
+                inputs = torch.zeros((1, 1, 8), dtype=dtype)
+                inputs[..., :2] = -1.
+                z = mlp.forward_d16_objects(inputs)
+                self.assertFalse(bool(z.is_zero().any()))
+                self.assertEqual(float(z.y.item()), 0.)
+                expected = -F.silu(torch.tensor(-1., dtype=dtype))
+                torch.testing.assert_close(mlp(inputs)[0, 0, 0], expected)
+
+    def test_indifferent_steering_produces_canonical_zero(self) -> None:
+        for dtype in (torch.float32, torch.float64):
+            for channels in (None, torch.tensor([0, 2, 3])):
+                with self.subTest(dtype=dtype, channels=channels):
+                    L = torch.tensor([[[1., -1., 0., float("nan")],
+                                       [1., -1., 2., 3.]]], dtype=dtype)
+                    E = torch.tensor([[[.2, -.3, 0., 1.],
+                                       [.2, .4, -.2, .5]]], dtype=dtype)
+                    z = D16ComplexTensor.from_xy(L, E)
+                    before = z.clone()
+                    upper = z.state() < 8
+                    selected = torch.zeros_like(upper)
+                    if channels is None:
+                        selected = upper
+                    else:
+                        selected[..., -1, channels] = upper[..., -1, channels]
+                    out = _apply_sector_steering(z, "active_to_indifferent", channels=channels)
+                    self.assertTrue(bool((out.rotation[selected] == MASK_ZERO).all()))
+                    self.assertTrue(bool((out.x[selected] == 0.).all()))
+                    self.assertTrue(bool((out.y[selected] == 0.).all()))
+                    self.assertTrue(bool((out.abs()[selected] == 0.).all()))
+                    self.assertTrue(bool((out.norm_squared()[selected] == 0.).all()))
+                    validated = D16ComplexTensor.make(out.x, out.y, out.rotation)
+                    self.assertTrue(torch.equal(validated.rotation, out.rotation))
+                    for attr in ("x", "y", "rotation"):
+                        self.assertTrue(torch.equal(getattr(out, attr)[~selected], getattr(before, attr)[~selected]))
+                        self.assertTrue(torch.equal(getattr(z, attr), getattr(before, attr)))
 
     def test_bitwise_orbit_links_preserve_object_count_and_rotate_mask(self) -> None:
         torch.manual_seed(5)
