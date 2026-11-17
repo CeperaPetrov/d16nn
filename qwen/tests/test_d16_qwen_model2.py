@@ -176,6 +176,47 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
         self.assertTrue(bool((gen.x.to(torch.long) == raw_tokens).all()))
 
 
+    def test_d16_activate_modes_and_mlp_variants(self) -> None:
+        torch.manual_seed(31)
+        re = torch.randn(3, 8, dtype=torch.float64)
+        im = torch.randn(3, 8, dtype=torch.float64)
+        z = D16ComplexTensor.encode_coordinates(re, im)
+
+        # 1. Verify standalone .sigmoid() compresses radius into r / (1 + r) in [0, 1) and preserves rotation,
+        #    while .activate("sigmoid") executes z * z.sigmoid()
+        sig_z = z.sigmoid()
+        self.assertTrue(bool((sig_z.rotation == z.rotation).all()))
+        self.assertTrue(bool((sig_z.norm_squared().sqrt() < 1.0).all()))
+
+        act_sig = z.activate("sigmoid")
+        prod_sig = z * z.sigmoid()
+        self.assertTrue(
+            bool((act_sig.x == prod_sig.x).all() and (act_sig.y == prod_sig.y).all() and (act_sig.rotation == prod_sig.rotation).all())
+        )
+
+        # 2. Verify all 3 MLP variants ('sigmoid', 'bilinear', 'sum', 'rel') run forward & backward cleanly
+        raw_ids = torch.randint(0, 16, (2, 6), dtype=torch.long)
+        d16_ids = encode_token_ids(raw_ids)
+        for act_mode in ("sigmoid", "bilinear", "sum", "rel"):
+            cfg = D16QwenConfig(
+                vocab_size=16,
+                hidden_size=16,
+                intermediate_size=24,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                weight_storage="d16",
+                indiff_eps="auto",
+                indiff_rel=0.25,
+                mlp_activation=act_mode,
+            )
+            model = D16QwenForCausalLM(cfg)
+            opt = D16AdamW(model.d16_parameters(), lr=1e-2)
+            out = model(d16_ids, labels=d16_ids)
+            out.loss.x.backward()
+            opt.step(max_grad_norm=1.0)
+            self.assertTrue(bool(torch.isfinite(out.loss.x)))
+
     def test_rotation_free_wedge_softmax_invariance_and_cutoff(self) -> None:
         torch.manual_seed(23)
         re = torch.randn(4, 12, dtype=torch.float64)

@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import repeat
 import math
-from typing import Literal, Optional
+from typing import Callable, Literal, Optional, Union
 
 import torch
 from torch import nn
@@ -32,6 +32,7 @@ from d16_qwen_model import (
 
 WeightStorage = Literal["d16", "cartesian"]
 IndiffThreshold = float | Literal["auto"]
+MLPActivation = Union[Literal["sigmoid", "bilinear", "gate", "sum", "rel"], Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]
 
 
 def _stores_d16(weight_storage: WeightStorage) -> bool:
@@ -73,6 +74,7 @@ class D16QwenConfig(_QwenConfig):
     weight_storage: WeightStorage = "d16"
     indiff_eps: IndiffThreshold = 0.0
     indiff_rel: float = 0.25
+    mlp_activation: MLPActivation = "sigmoid"
 
     @property
     def complex_hidden_size(self) -> int:
@@ -335,13 +337,25 @@ class D16QwenAttention(nn.Module):
 
 
 class D16QwenMLP(nn.Module):
-    """Apply 0.5 * z^2 * sigmoid(Im(z)) and project the full complex result."""
+    """Wedge-native D16 MLP supporting:
+    - Variant 1 (default, 'sigmoid'): z.activate('sigmoid')  [executes z * z.sigmoid()]
+    - Variant 2 ('bilinear'): z * g  with up_proj and gate_proj
+    - Variant 3 ('sum', 'rel', or callable): z.activate(mode) directly over wedge coordinates (x, y)
+    """
 
     def __init__(self, config: D16QwenConfig) -> None:
         super().__init__()
         ws = config.weight_storage
+        self.mlp_activation: MLPActivation = config.mlp_activation
         self.up_proj = D16Linear(
             config.complex_hidden_size, config.intermediate_size, bias=config.mlp_bias, weight_storage=ws
+        )
+        self.gate_proj: Optional[D16Linear] = (
+            D16Linear(
+                config.complex_hidden_size, config.intermediate_size, bias=config.mlp_bias, weight_storage=ws
+            )
+            if self.mlp_activation in ("bilinear", "gate")
+            else None
         )
         self.down_proj = D16Linear(
             config.intermediate_size, config.complex_hidden_size, bias=config.mlp_bias, weight_storage=ws
@@ -378,10 +392,16 @@ class D16QwenMLP(nn.Module):
 
         dtype = torch.float32 if z.dtype in (torch.float16, torch.bfloat16) else z.dtype
         z = z.to(dtype)
-        _, imag = z.unpack()
-        gate = imag.real_sigmoid()
-        squared = z * z
-        return self.down_proj((squared * (0.5 * gate.x)).to(hidden_states.dtype))
+
+        if self.mlp_activation in ("bilinear", "gate"):
+            if self.gate_proj is None:
+                raise RuntimeError("gate_proj is not initialized for bilinear MLP mode")
+            g = self.gate_proj(hidden_states, eps=self.indiff_eps, rel=self.indiff_rel).to(dtype)
+            activated = (z * g.sigmoid()) if self.mlp_activation == "gate" else (z * g)
+        else:
+            activated = z.activate(self.mlp_activation)
+
+        return self.down_proj(activated.to(hidden_states.dtype))
 
 
 class D16QwenDecoderLayer(nn.Module):

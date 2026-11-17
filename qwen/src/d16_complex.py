@@ -517,6 +517,38 @@ class D16Complex:
     def square(self) -> D16Complex:
         return self.multiply(self)
 
+    def sigmoid(self) -> D16Complex:
+        """Radial wedge sigmoid: compress vector length r = sqrt(x^2 + y^2) into r / (1 + r) in [0, 1)."""
+        if self.is_nan() or self.is_zero():
+            return self
+        r = math.hypot(self.x, self.y)
+        factor = 1.0 / (1.0 + r)
+        return self.make(self.x * factor, self.y * factor, self.rotation)
+
+    def activate(self, mode: Union[str, Callable[[float, float], float]] = "sigmoid") -> D16Complex:
+        """Apply a wedge-native non-linearity over (x, y) in [0°, 22.5°]."""
+        if self.is_nan() or self.is_zero():
+            return self
+        if mode == "sigmoid":
+            return self * self.sigmoid()
+        if callable(mode):
+            factor = float(mode(self.x, self.y))
+        elif mode == "sum":
+            r = math.hypot(self.x, self.y)
+            factor = (self.x + self.y) / (1.0 + r)
+        elif mode == "rel":
+            factor = self.y / max(self.x, 1e-12)
+        else:
+            raise ValueError(f"Unknown D16 activation mode: {mode!r}")
+        if not _finite_value(factor):
+            return self.nan()
+        if factor == 0.0:
+            return self.zero()
+        neg = factor < 0.0
+        mag = -factor if neg else factor
+        out = self.apply_group_op(4) if neg else self
+        return self.make(out.x * mag, out.y * mag, out.rotation)
+
     def add(self, other: D16Complex) -> D16Complex:
         if not isinstance(other, D16Complex):
             return NotImplemented
@@ -1413,6 +1445,42 @@ if _HAS_TORCH:
 
         def square(self) -> "D16ComplexTensor":
             return self.multiply(self)
+
+        def sigmoid(self) -> "D16ComplexTensor":
+            """Radial wedge sigmoid: compress vector length r = sqrt(x^2 + y^2) into r / (1 + r) in [0, 1)."""
+            calc_dtype = torch.float32 if self.dtype in (torch.float16, torch.bfloat16) else self.dtype
+            x = self.x.to(calc_dtype)
+            y = self.y.to(calc_dtype)
+            r = (x.square() + y.square() + 1e-12).sqrt() - 1e-6
+            factor = 1.0 / (1.0 + r)
+            return _scale_wedge(self, factor.to(self.dtype))
+
+        def activate(
+            self,
+            mode: Union[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = "sigmoid",
+        ) -> "D16ComplexTensor":
+            """Apply a wedge-native non-linearity purely over (x, y) in [0°, 22.5°].
+
+            - 'sigmoid': executes `self * self.sigmoid()`, rotating sector angle to 2*theta
+                         with length |z|^2 / (1 + |z|) (quadratic near 0, linear for large |z|).
+            - 'sum'    : scales `self` by (x + y) / (1 + r).
+            - 'rel'    : scales `self` by the wedge ratio y / (x + eps) in [0, sqrt(2) - 1].
+            """
+            if mode == "sigmoid":
+                return self * self.sigmoid()
+            calc_dtype = torch.float32 if self.dtype in (torch.float16, torch.bfloat16) else self.dtype
+            x = self.x.to(calc_dtype)
+            y = self.y.to(calc_dtype)
+            if callable(mode):
+                factor = mode(x, y)
+            elif mode == "sum":
+                r = (x.square() + y.square() + 1e-12).sqrt() - 1e-6
+                factor = (x + y) / (1.0 + r)
+            elif mode == "rel":
+                factor = y / (x + 1e-6)
+            else:
+                raise ValueError(f"Unknown D16 activation mode: {mode!r}")
+            return _scale_wedge(self, factor.to(self.dtype))
 
         def __add__(self, other: "D16ComplexTensor") -> "D16ComplexTensor":
             return self.add(other)
