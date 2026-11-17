@@ -944,40 +944,22 @@ if _HAS_TORCH:
 
     class _PackComplex(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, re, re_mask, im, im_mask):
-            re_negative = re_mask == REAL_NEGATIVE
-            im_negative = im_mask == REAL_NEGATIVE
-            upper = torch.where(re_negative, 1, 0)
-            lower = torch.where(re_negative, 2, 3)
-            quadrant = torch.where(im_negative, lower, upper)
-            even_quadrant = (quadrant & 1) == 0
-            u = torch.where(even_quadrant, re, im)
-            v = torch.where(even_quadrant, im, re)
-            swapped = v >= u
-            wx = torch.where(swapped, v, u)
-            wy = torch.where(swapped, u, v)
-
-            diagonal = above_bisector_d16(wx, wy)
-            x = torch.where(diagonal, rotated_sum_d16(wx, wy), wx)
-            y = torch.where(diagonal, (wx - wy) * INV_SQRT2, wy)
-            sector = 4 * quadrant + torch.where(
-                diagonal, torch.where(swapped, 2, 1), torch.where(swapped, 3, 0)
-            )
-            x, y, rotation = d16_reduced_u16(x, y, sector, (wx == 0) & (wy == 0))
-            undefined = (re_mask == MASK_NAN) | (im_mask == MASK_NAN)
-            rotation = rotation.masked_fill(undefined, MASK_NAN)
-            ctx.save_for_backward(rotation, re_negative, im_negative)
+        def forward(ctx, real: torch.Tensor, imag: torch.Tensor):
+            x, y, rotation = d16_from_xy_u16(real, imag)
+            ctx.save_for_backward(rotation)
+            ctx. re_shape = real.shape
+            ctx.im_shape = imag.shape
             ctx.mark_non_differentiable(rotation)
-            return x.masked_fill(undefined, 0), y.masked_fill(undefined, 0), rotation
+            return x, y, rotation
 
         @staticmethod
         def backward(ctx, grad_x, grad_y, _grad_rotation):
-            rotation, re_negative, im_negative = ctx.saved_tensors
+            (rotation,) = ctx.saved_tensors
             grad_re, grad_im = _from_chart(grad_x, grad_y, rotation)
             undefined = rotation == MASK_NAN
-            grad_re = torch.where(re_negative, -grad_re, grad_re).masked_fill(undefined, 0)
-            grad_im = torch.where(im_negative, -grad_im, grad_im).masked_fill(undefined, 0)
-            return grad_re.sum_to_size(re_negative.shape), None, grad_im.sum_to_size(im_negative.shape), None
+            grad_re = grad_re.masked_fill(undefined, 0.0)
+            grad_im = grad_im.masked_fill(undefined, 0.0)
+            return grad_re.sum_to_size(ctx.re_shape), grad_im.sum_to_size(ctx.im_shape)
 
     class _MultiplyComplex(torch.autograd.Function):
         @staticmethod
@@ -1243,12 +1225,13 @@ if _HAS_TORCH:
             return _from_real(value)
 
         @classmethod
-        def pack(cls, re: "D16ComplexTensor", im: "D16ComplexTensor") -> "D16ComplexTensor":
-            return cls(*_PackComplex.apply(re.x, re.rotation, im.x, im.rotation))
+        def pack(cls, real: torch.Tensor, imag: torch.Tensor) -> "D16ComplexTensor":
+            """Pack Cartesian real and imaginary float tensors [float, float] into a D16ComplexTensor."""
+            return cls(*_PackComplex.apply(real, imag))
 
         @classmethod
         def encode_coordinates(cls, real: torch.Tensor, imag: torch.Tensor) -> "D16ComplexTensor":
-            return cls.pack(_from_real(real), _from_real(imag))
+            return cls.pack(real, imag)
 
         @classmethod
         def from_xy(
@@ -1335,10 +1318,8 @@ if _HAS_TORCH:
         def to_xy(self) -> Tuple[torch.Tensor, torch.Tensor]:
             return d16_to_xy_u16(self.x, self.y, self.rotation)
 
-        def unpack(self) -> Tuple["D16ComplexTensor", "D16ComplexTensor"]:
-            re, im = _from_chart(self.x, self.y, self.rotation)
-            undefined = self.is_nan()
-            return _from_real(re.masked_fill(undefined, float("nan"))), _from_real(im.masked_fill(undefined, float("nan")))
+        def unpack(self) -> Tuple[torch.Tensor, torch.Tensor]:
+            return _from_chart(self.x, self.y, self.rotation)
 
         def real_signed(self) -> torch.Tensor:
             """Extract signed scalar tensor for a real-axis D16ComplexTensor."""
@@ -1437,7 +1418,7 @@ if _HAS_TORCH:
             else:
                 threshold = eps
             re, im = self.unpack()
-            return self.to_indifferent_where((re.x + im.x) <= threshold)
+            return self.to_indifferent_where((re.abs() + im.abs()) <= threshold)
 
         # --- Dihedral & Algebraic Operations (Autograd-Enabled) ---
 

@@ -109,15 +109,15 @@ class D16Linear(nn.Module):
 
     def _project_tile(
         self,
-        re: D16ComplexTensor,
-        im: D16ComplexTensor,
+        re: torch.Tensor,
+        im: torch.Tensor,
         weight: D16ComplexTensor,
         bias: Optional[D16ComplexTensor],
         dtype: torch.dtype,
     ) -> D16ComplexTensor:
         wr, wi = weight.map_tensors(lambda t: t.transpose(0, 1)).to(re.dtype).unpack()
-        out_re = re.real_matmul(wr).real_sub(im.real_matmul(wi))
-        out_im = re.real_matmul(wi).real_add(im.real_matmul(wr))
+        out_re = re @ wr - im @ wi
+        out_im = re @ wi + im @ wr
         z = D16ComplexTensor.pack(out_re, out_im)
         if bias is not None:
             z = z + bias.to(re.dtype)
@@ -251,14 +251,14 @@ class D16QwenAttention(nn.Module):
         dtype = torch.float64 if query.dtype == torch.float64 else torch.float32
         q_re, q_im = query.to(dtype).unpack()
         k_re, k_im = key.to(dtype).map_tensors(lambda t: t.transpose(-1, -2).unsqueeze(2)).unpack()
-        scores_re = q_re.real_matmul(k_re).real_add(q_im.real_matmul(k_im))
-        scores_im = q_im.real_matmul(k_re).real_sub(q_re.real_matmul(k_im))
+        scores_re = (q_re @ k_re) + (q_im @ k_im)
+        scores_im = (q_im @ k_re) - (q_re @ k_im)
         scores = D16ComplexTensor.pack(scores_re, scores_im) * (head_dim ** -0.5)
         allowed = None if attention_mask is None else attention_mask.unsqueeze(2)
         weights = scores.wedge_softmax(allowed, eps=self.indiff_eps, rel=self.indiff_rel)
 
         v_re, v_im = value.to(dtype).map_tensors(lambda t: t.unsqueeze(2)).unpack()
-        output = D16ComplexTensor.pack(weights.real_matmul(v_re), weights.real_matmul(v_im))
+        output = D16ComplexTensor.pack(weights.x @ v_re, weights.x @ v_im)
         output = output.map_tensors(
             lambda t: t.permute(0, 3, 1, 2, 4).reshape(batch, length, self.hidden_size)
         )

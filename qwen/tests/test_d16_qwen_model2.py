@@ -69,7 +69,9 @@ class TestD16EncapsulationAndAutograd(unittest.TestCase):
         zb = D16ComplexTensor.encode_coordinates(br, bi)
         zc = (za * zb) + (za - zb)
         out_r, out_i = zc.unpack()
-        loss_d16 = (out_r.real_signed().square() + 2.0 * out_i.real_signed().square()).sum()
+        self.assertIsInstance(out_r, torch.Tensor)
+        self.assertIsInstance(out_i, torch.Tensor)
+        loss_d16 = (out_r.square() + 2.0 * out_i.square()).sum()
         loss_d16.backward()
 
         ar_ref = ar.detach().clone().requires_grad_(True)
@@ -100,7 +102,6 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
             num_hidden_layers=2,
             num_attention_heads=4,
             num_key_value_heads=2,
-            weight_storage="d16",
             indiff_eps="auto",
             indiff_rel=0.65,
         )
@@ -138,7 +139,6 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
             num_hidden_layers=2,
             num_attention_heads=4,
             num_key_value_heads=2,
-            weight_storage="d16",
         )
         model = D16QwenForCausalLM(cfg)
         optimizer = D16AdamW(model.d16_parameters(), lr=2.5e-2, weight_decay=1e-3)
@@ -176,6 +176,17 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
         self.assertTrue(bool((gen.x.to(torch.long) == raw_tokens).all()))
 
 
+    def test_single_branch_d16_rmsnorm_unit_variance_and_complex_gain(self) -> None:
+        torch.manual_seed(17)
+        re = torch.randn(2, 5, 16, dtype=torch.float64) * 4.0
+        im = torch.randn(2, 5, 16, dtype=torch.float64) * 4.0
+        z = D16ComplexTensor.encode_coordinates(re, im)
+
+        normed = z.rms_normalize(eps=1e-12)
+        mean_sq = normed.norm_squared().mean(dim=-1)
+        self.assertLess(float((mean_sq - 1.0).abs().max().item()), 1e-10)
+        self.assertTrue(bool((normed.rotation == z.rotation).all()))
+
     def test_d16_activate_modes_and_mlp_variants(self) -> None:
         torch.manual_seed(31)
         re = torch.randn(3, 8, dtype=torch.float64)
@@ -205,8 +216,7 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
                 num_hidden_layers=1,
                 num_attention_heads=2,
                 num_key_value_heads=1,
-                weight_storage="d16",
-                indiff_eps="auto",
+                    indiff_eps="auto",
                 indiff_rel=0.25,
                 mlp_activation=act_mode,
             )
@@ -245,7 +255,6 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
             num_hidden_layers=2,
             num_attention_heads=4,
             num_key_value_heads=2,
-            weight_storage="d16",
             indiff_eps="auto",
             indiff_rel=0.25,
             collect_d16_stats=True,
@@ -282,8 +291,7 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
                 num_hidden_layers=2,
                 num_attention_heads=4,
                 num_key_value_heads=2,
-                weight_storage="d16",
-                indiff_eps="auto",
+                    indiff_eps="auto",
                 indiff_rel=0.25,
             )
             model = D16QwenForCausalLM(cfg)

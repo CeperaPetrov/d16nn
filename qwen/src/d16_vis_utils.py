@@ -813,8 +813,8 @@ def plot_d16_attention_heatmap(
         dtype = torch.float64 if query.dtype == torch.float64 else torch.float32
         q_re, q_im = query.to(dtype).unpack()
         k_re, k_im = key.to(dtype).map_tensors(lambda t: t.transpose(-1, -2).unsqueeze(2)).unpack()
-        scores_re = q_re.real_matmul(k_re).real_add(q_im.real_matmul(k_im))
-        scores_im = q_im.real_matmul(k_re).real_sub(q_re.real_matmul(k_im))
+        scores_re = (q_re @ k_re) + (q_im @ k_im)
+        scores_im = (q_im @ k_re) - (q_re @ k_im)
         scores = D16ComplexTensor.pack(scores_re, scores_im) * (head_dim ** -0.5)
         allowed = None if attention_mask is None else attention_mask.unsqueeze(2)
         weights = scores.wedge_softmax(allowed, eps=attn.indiff_eps, rel=attn.indiff_rel)
