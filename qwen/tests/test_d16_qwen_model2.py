@@ -168,6 +168,25 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
         self.assertTrue(bool((gen.x.to(torch.long) == raw_tokens).all()))
 
 
+    def test_rotation_free_wedge_softmax_invariance_and_cutoff(self) -> None:
+        torch.manual_seed(23)
+        re = torch.randn(4, 12, dtype=torch.float64)
+        im = torch.randn(4, 12, dtype=torch.float64)
+        z = D16ComplexTensor.encode_coordinates(re, im)
+
+        # Rotating masks across all 16 dihedral operations must not change wedge_softmax or wedge_argmax!
+        p_base = z.wedge_softmax(eps="auto", rel=0.30)
+        idx_base = z.wedge_argmax(eps="auto", rel=0.30)
+        for op_id in range(1, 16):
+            z_rot = z.apply_group_op(op_id)
+            p_rot = z_rot.wedge_softmax(eps="auto", rel=0.30)
+            idx_rot = z_rot.wedge_argmax(eps="auto", rel=0.30)
+            self.assertTrue(bool((p_base.x == p_rot.x).all()))
+            self.assertTrue(bool((idx_base == idx_rot).all()))
+
+        # Sub-threshold signals are cut off to exactly 0 probability in wedge_softmax
+        self.assertGreater(int((p_base.x == 0.0).sum().item()), 0)
+
     def test_activation_auto_indiff_threshold_and_runtime_switch(self) -> None:
         torch.manual_seed(19)
         cfg = D16QwenConfig(

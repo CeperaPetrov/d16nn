@@ -285,6 +285,8 @@ class D16QwenAttention(nn.Module):
         self.hidden_size = config.complex_hidden_size
         kv_size = self.num_kv_heads * self.head_dim
         ws = config.weight_storage
+        self.indiff_eps: IndiffThreshold = config.indiff_eps
+        self.indiff_rel: float = config.indiff_rel
         self.q_proj = D16Linear(self.hidden_size, self.hidden_size, bias=config.attention_bias, weight_storage=ws)
         self.k_proj = D16Linear(self.hidden_size, kv_size, bias=config.attention_bias, weight_storage=ws)
         self.v_proj = D16Linear(self.hidden_size, kv_size, bias=config.attention_bias, weight_storage=ws)
@@ -322,9 +324,12 @@ class D16QwenAttention(nn.Module):
         dtype = torch.float64 if query.dtype == torch.float64 else torch.float32
         q_re, q_im = query.to(dtype).unpack()
         k_re, k_im = key.to(dtype).map_tensors(lambda t: t.transpose(-1, -2).unsqueeze(2)).unpack()
-        scores = q_re.real_matmul(k_re).real_add(q_im.real_matmul(k_im)) * (head_dim ** -0.5)
+        # Full complex Hermitian inner product Q @ K^H packed into the [0°, 22.5°] wedge
+        scores_re = q_re.real_matmul(k_re).real_add(q_im.real_matmul(k_im))
+        scores_im = q_im.real_matmul(k_re).real_sub(q_re.real_matmul(k_im))
+        scores = D16ComplexTensor.pack(scores_re, scores_im) * (head_dim ** -0.5)
         allowed = None if attention_mask is None else attention_mask.unsqueeze(2)
-        weights = scores.real_softmax(allowed)
+        weights = scores.wedge_softmax(allowed, eps=self.indiff_eps, rel=self.indiff_rel)
 
         v_re, v_im = value.to(dtype).map_tensors(lambda t: t.unsqueeze(2)).unpack()
         output = D16ComplexTensor.pack(weights.real_matmul(v_re), weights.real_matmul(v_im))
@@ -536,8 +541,9 @@ class D16QwenForCausalLM(_QwenControls):
             targets = _token_addresses(labels, self.model.embed_tokens.token_keys(), allow_ignore=True)
             if targets.shape != input_ids.shape:
                 raise ValueError("Labels must have the same shape as the input token IDs")
-            scores, _ = output.logits[..., :-1, :].unpack()
-            output.loss = scores.real_cross_entropy(targets[..., 1:])
+            output.loss = output.logits[..., :-1, :].wedge_cross_entropy(
+                targets[..., 1:], eps=self.config.indiff_eps, rel=self.config.indiff_rel
+            )
         return output
 
     @torch.no_grad()
@@ -564,15 +570,16 @@ class D16QwenForCausalLM(_QwenControls):
                 inputs = generated[:, -1:] if past is not None else generated
                 hidden_states, past = self.model(inputs, past_key_values=past, use_cache=use_cache)
                 logits = self.lm_head(hidden_states[:, -1])
-                scores, _ = logits.unpack()
                 if do_sample:
-                    if scores.dtype in (torch.float16, torch.bfloat16):
-                        scores = scores.to(torch.float32)
-                    inv_temp = D16ComplexTensor.from_real(scores.x.new_tensor(1.0 / max(temperature, 1e-5)))
-                    probabilities = scores.real_multiply(inv_temp).real_softmax()
+                    scaled_logits = logits.to(torch.float32) * (1.0 / max(temperature, 1e-5))
+                    probabilities = scaled_logits.wedge_softmax(
+                        eps=self.config.indiff_eps, rel=self.config.indiff_rel
+                    )
                     addresses = torch.multinomial(probabilities.x, num_samples=1)
                 else:
-                    addresses = scores.real_argmax()
+                    addresses = logits.wedge_argmax(
+                        eps=self.config.indiff_eps, rel=self.config.indiff_rel
+                    )
                 generated = D16ComplexTensor.cat((generated, keys[addresses]), dim=-1)
                 if eos_token_id is not None and bool((addresses == eos_token_id).all()):
                     break

@@ -1489,6 +1489,103 @@ if _HAS_TORCH:
             mean = (total / valid.sum()).masked_fill((undefined.any(dim=-1) & valid).any(), float("nan"))
             return _from_real(mean)
 
+        # --- Rotation-Free Wedge Signal & Softmax Operations (Using only x, y in [0°, 22.5°]) ---
+
+        def wedge_strength(
+            self,
+            *,
+            eps: Union[float, torch.Tensor, str] = 0.0,
+            rel: float = 0.25,
+        ) -> torch.Tensor:
+            """Compute rotation-free signal strength from wedge coordinates (x, y) with weak-signal cutoff."""
+            dtype = torch.float32 if self.dtype in (torch.float16, torch.bfloat16) else self.dtype
+            x, y = self.x.to(dtype), self.y.to(dtype)
+            strength = (x.square() + y.square() + 1e-12).sqrt() - 1e-6
+
+            if isinstance(eps, str):
+                if eps != "auto":
+                    raise ValueError(f"Unknown wedge threshold mode: {eps!r}")
+                if rel > 0.0:
+                    rms = (x.square() + y.square()).mean(dim=-1, keepdim=True).sqrt()
+                    thresh = rms * rel
+                    strength = torch.where(strength <= thresh, torch.zeros_like(strength), strength)
+            elif isinstance(eps, (int, float)):
+                if eps > 0.0:
+                    strength = torch.where(strength <= float(eps), torch.zeros_like(strength), strength)
+            else:
+                strength = torch.where(strength <= eps, torch.zeros_like(strength), strength)
+
+            return strength.masked_fill(self.is_nan(), float("nan"))
+
+        def wedge_softmax(
+            self,
+            allowed: Optional[torch.Tensor] = None,
+            *,
+            eps: Union[float, torch.Tensor, str] = 0.0,
+            rel: float = 0.25,
+        ) -> "D16ComplexTensor":
+            """Normalize rotation-free wedge signal strength (x, y) and cut off sub-threshold noise to zero."""
+            if self.shape[-1] == 0:
+                return self
+            undefined = self.is_nan()
+            strength = self.wedge_strength(eps=eps, rel=rel)
+            active = ~undefined if allowed is None else (allowed & ~undefined)
+            if allowed is not None:
+                undefined = undefined & allowed
+
+            has_cutoff = (isinstance(eps, str) and eps == "auto" and rel > 0.0) or (
+                isinstance(eps, (int, float)) and eps > 0.0
+            )
+            if has_cutoff:
+                above_cutoff = active & (strength > 0.0)
+                has_survivor = above_cutoff.any(dim=-1, keepdim=True)
+                eff_active = torch.where(has_survivor, above_cutoff, active)
+            else:
+                eff_active = active
+
+            max_val = torch.where(eff_active, strength, -float("inf")).amax(dim=-1, keepdim=True)
+            max_val = torch.where(torch.isfinite(max_val), max_val, 0.0)
+            terms = torch.where(eff_active, (strength - max_val).exp(), 0.0)
+            probabilities = (terms / terms.sum(dim=-1, keepdim=True).clamp_min(1.0)).to(self.dtype)
+            return _real_magnitude(probabilities, torch.zeros_like(undefined), undefined.any(dim=-1, keepdim=True))
+
+        def wedge_argmax(
+            self,
+            *,
+            eps: Union[float, torch.Tensor, str] = 0.0,
+            rel: float = 0.25,
+        ) -> torch.Tensor:
+            """Return the index of the strongest wedge signal (x, y) without consulting rotation."""
+            undefined = self.is_nan()
+            strength = self.wedge_strength(eps=eps, rel=rel)
+            max_val, address = strength.masked_fill(undefined, -float("inf")).max(dim=-1, keepdim=True)
+            if bool((~max_val.isfinite()).any()):
+                raise ValueError("Cannot select a token from undefined logits")
+            return address
+
+        def wedge_cross_entropy(
+            self,
+            targets: torch.Tensor,
+            *,
+            eps: Union[float, torch.Tensor, str] = 0.0,
+            rel: float = 0.25,
+        ) -> "D16ComplexTensor":
+            """Mean negative log-likelihood from rotation-free wedge signal strength (x, y)."""
+            undefined = self.is_nan()
+            strength = self.wedge_strength(eps=eps, rel=rel)
+            valid = targets != -100
+            addresses = targets.masked_fill(~valid, 0).unsqueeze(-1)
+            selected = strength.gather(-1, addresses).squeeze(-1)
+
+            max_val = strength.masked_fill(undefined, -float("inf")).amax(dim=-1, keepdim=True)
+            max_val = torch.where(torch.isfinite(max_val), max_val, 0.0)
+            terms = torch.where(~undefined, (strength - max_val).exp(), 0.0)
+            losses = (terms.sum(dim=-1).log() + max_val.squeeze(-1)) - selected
+            mean = (losses.masked_fill(~valid, 0.0).sum() / valid.sum()).masked_fill(
+                (undefined.any(dim=-1) & valid).any(), float("nan")
+            )
+            return _from_real(mean)
+
         def __repr__(self) -> str:
             return f"D16ComplexTensor(shape={tuple(self.shape)}, dtype={self.dtype}, device={self.device})"
 

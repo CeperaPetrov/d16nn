@@ -688,8 +688,12 @@ class D16QwenForCausalLM(nn.Module):
             self.config.indiff_rel = float(rel)
         for layer in self.model.layers:
             layer.mlp.indiff_eps = eps
+            if hasattr(layer, "self_attn"):
+                layer.self_attn.indiff_eps = eps
             if rel is not None:
                 layer.mlp.indiff_rel = float(rel)
+                if hasattr(layer, "self_attn"):
+                    layer.self_attn.indiff_rel = float(rel)
 
     def set_collect_d16_stats(self, enabled: bool = True, reset: bool = True) -> None:
         self.config.collect_d16_stats = enabled
