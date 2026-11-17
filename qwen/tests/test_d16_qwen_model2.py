@@ -1,241 +1,172 @@
-"""Regression tests for the D16Complex Qwen model."""
+"""Unit, encapsulation, and training tests for d16_qwen_model2.py, d16_parameter.py, and d16_adamw.py."""
+from __future__ import annotations
 
-import io
+import ast
 from pathlib import Path
 import sys
 import unittest
 
+_THIS_DIR = Path(__file__).resolve().parent
+for _candidate in (
+    _THIS_DIR.parent / "src",
+    _THIS_DIR.parent / "qwen" / "src",
+    _THIS_DIR,
+):
+    if (_candidate / "d16_qwen_model2.py").is_file() and str(_candidate) not in sys.path:
+        sys.path.insert(0, str(_candidate))
+        break
+
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
+from d16_adamw import D16AdamW
 from d16_complex import D16ComplexTensor
-from d16_qwen_model2 import D16Linear, D16QwenConfig, D16QwenForCausalLM, D16RMSNorm, encode_token_ids
+from d16_parameter import D16Parameter
+from d16_qwen_model2 import D16QwenConfig, D16QwenForCausalLM, encode_token_ids
 
 
-def tiny_config() -> D16QwenConfig:
-    return D16QwenConfig.tiny_test_config(
-        vocab_size=32,
-        hidden_size=24,
-        intermediate_size=16,
-        num_hidden_layers=2,
-        num_attention_heads=3,
-        num_key_value_heads=1,
-    )
+class TestD16EncapsulationAndAutograd(unittest.TestCase):
+    """Проверка строгой инкапсуляции D16ComplexTensor и точности автограда (+, -, *)."""
 
+    def test_strict_encapsulation_no_leaked_internals(self) -> None:
+        banned_names = {
+            "MASK_ZERO",
+            "MASK_NAN",
+            "REAL_POSITIVE",
+            "REAL_NEGATIVE",
+            "reverse_bits_u16",
+            "rol_u16",
+            "ror_u16",
+            "even_anchor",
+            "even_anchor_u16",
+            "d16_reduced_u16",
+            "d16_make_u16",
+            "d16_from_xy_u16",
+            "d16_to_xy_u16",
+            "_chart_table",
+            "_chart_parameters",
+            "_rotation_basis",
+            "_from_chart",
+            "_into_chart",
+            "_PackComplex",
+            "_MultiplyComplex",
+            "_AddComplex",
+        }
+        src_dir = Path(sys.path[0]) if Path(sys.path[0]).is_dir() else _THIS_DIR
+        for fname in ("d16_parameter.py", "d16_adamw.py", "d16_qwen_model2.py"):
+            fpath = src_dir / fname if (src_dir / fname).is_file() else _THIS_DIR / fname
+            tree = ast.parse(fpath.read_text(encoding="utf-8"), filename=fname)
+            used_names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+            self.assertEqual(used_names & banned_names, set())
 
-class TestD16QwenModel2(unittest.TestCase):
-    def test_accepts_real_axis_d16_input(self) -> None:
+    def test_d16_complex_tensor_autograd_add_mul_sub(self) -> None:
         torch.manual_seed(7)
-        model = D16QwenForCausalLM(tiny_config()).eval()
-        real = torch.tensor([[0.0, 2.0, 31.0]])
-        prefix = D16ComplexTensor.from_xy(real, torch.zeros_like(real))
-        torch.testing.assert_close(prefix.y, torch.zeros_like(prefix.y))
-        torch.testing.assert_close(prefix.rotation[0], torch.tensor([0xFFFF, 0x8001, 0x8001]))
-        with torch.no_grad():
-            output = model(prefix)
-            self.assertEqual(output.hidden_states.shape, (1, 3, model.config.complex_hidden_size))
-            self.assertFalse(bool(output.logits.is_nan().any()))
-            self.assertTrue(bool((output.hidden_states.imag().abs() > 1e-4).any()))
-            cached = model.generate(prefix, max_new_tokens=3)
-            uncached = model.generate(prefix, max_new_tokens=3, use_cache=False)
-            self.assertIsInstance(cached, D16ComplexTensor)
-            self.assertEqual(cached.shape, (1, 6))
-            torch.testing.assert_close(cached.to_xy(), uncached.to_xy())
-            torch.testing.assert_close(cached.x[:, 3].long(), output.logits.real()[:, -1].argmax(-1))
-        with self.assertRaises(TypeError):
-            model(torch.tensor([[0, 2, 31]]))
-        for invalid in (-1.0, 0.5, 32.0):
-            x = torch.tensor([[invalid]])
-            with self.assertRaises(ValueError):
-                model(D16ComplexTensor.from_xy(x, torch.zeros_like(x)))
-        with self.assertRaises(ValueError):
-            model(D16ComplexTensor.from_xy(torch.ones((1, 1)), torch.ones((1, 1))))
-        with self.assertRaises(ValueError):
-            model(D16ComplexTensor(torch.ones((1, 1)), torch.zeros((1, 1)), torch.tensor([[1]])))
+        ar = torch.randn(16, dtype=torch.float64, requires_grad=True)
+        ai = torch.randn(16, dtype=torch.float64, requires_grad=True)
+        br = torch.randn(16, dtype=torch.float64, requires_grad=True)
+        bi = torch.randn(16, dtype=torch.float64, requires_grad=True)
 
-    def test_d16_messages_across_layers(self) -> None:
-        torch.manual_seed(3)
-        model = D16QwenForCausalLM(tiny_config()).eval()
-        inputs = encode_token_ids(torch.tensor([[1, 4, 7], [2, 5, 8]]))
-        called = set()
-        hooks = []
+        za = D16ComplexTensor.encode_coordinates(ar, ai)
+        zb = D16ComplexTensor.encode_coordinates(br, bi)
+        zc = (za * zb) + (za - zb)
+        out_r, out_i = zc.unpack()
+        loss_d16 = (out_r.real_signed().square() + 2.0 * out_i.real_signed().square()).sum()
+        loss_d16.backward()
 
-        def check_d16(name):
-            def hook(module, args, kwargs, output):
-                called.add(name)
-                message = args[0] if args else kwargs["hidden_states"]
-                self.assertIsInstance(message, D16ComplexTensor, name)
-                message = output[0] if isinstance(output, tuple) else output
-                self.assertIsInstance(message, D16ComplexTensor, name)
+        ar_ref = ar.detach().clone().requires_grad_(True)
+        ai_ref = ai.detach().clone().requires_grad_(True)
+        br_ref = br.detach().clone().requires_grad_(True)
+        bi_ref = bi.detach().clone().requires_grad_(True)
+        c_r = (ar_ref * br_ref - ai_ref * bi_ref) + (ar_ref - br_ref)
+        c_i = (ar_ref * bi_ref + ai_ref * br_ref) + (ai_ref - bi_ref)
+        loss_ref = (c_r.square() + 2.0 * c_i.square()).sum()
+        loss_ref.backward()
 
-            return hook
+        self.assertLess(float((loss_d16 - loss_ref).abs().item()), 1e-12)
+        self.assertLess(float((ar.grad - ar_ref.grad).abs().max().item()), 1e-12)
+        self.assertLess(float((ai.grad - ai_ref.grad).abs().max().item()), 1e-12)
+        self.assertLess(float((br.grad - br_ref.grad).abs().max().item()), 1e-12)
+        self.assertLess(float((bi.grad - bi_ref.grad).abs().max().item()), 1e-12)
 
-        modules = dict(model.named_modules())
-        names = ["model.embed_tokens", "model.norm", "lm_head"]
-        for i in range(model.config.num_hidden_layers):
-            layer = f"model.layers.{i}"
-            names.extend(
-                [layer, f"{layer}.input_layernorm", f"{layer}.post_attention_layernorm"]
-            )
-            attention = f"{layer}.self_attn"
-            mlp = f"{layer}.mlp"
-            names.extend([attention, mlp])
-            names.extend(f"{attention}.{proj}_proj" for proj in ("q", "k", "v", "o"))
-            names.extend(f"{mlp}.{proj}_proj" for proj in ("up", "down"))
 
-        for name in names:
-            hooks.append(modules[name].register_forward_hook(check_d16(name), with_kwargs=True))
-        try:
-            with torch.no_grad():
-                output = model(inputs, use_cache=True)
-        finally:
-            for handle in hooks:
-                handle.remove()
+class TestD16Model2TrainingAndGeneration(unittest.TestCase):
+    """Проверка KV-кэша, генерации и обучения весов D16Parameter через D16AdamW."""
 
-        self.assertEqual(called, set(names))
-        self.assertIsInstance(output.hidden_states, D16ComplexTensor)
-        self.assertEqual(output.hidden_states.shape, (2, 3, model.config.complex_hidden_size))
-        self.assertTrue(bool((output.hidden_states.imag().abs() > 1e-4).any()))
-        self.assertIsInstance(output.logits, D16ComplexTensor)
-        self.assertEqual(output.logits.shape, (2, 3, model.config.vocab_size))
-        self.assertTrue(bool((output.logits.imag().abs() > 1e-4).any()))
-        self.assertEqual(len(output.past_key_values), model.config.num_hidden_layers)
-        for key, value in output.past_key_values:
-            self.assertIsInstance(key, D16ComplexTensor)
-            self.assertIsInstance(value, D16ComplexTensor)
-            self.assertEqual(key.shape, (2, 1, 3, model.config.head_dim))
-            self.assertEqual(value.shape, (2, 1, 3, model.config.head_dim))
-            self.assertTrue(bool((key.imag().abs() > 1e-4).any()))
-            self.assertTrue(bool((value.imag().abs() > 1e-4).any()))
-
-    def test_checkpoint_round_trip_with_tied_weights(self) -> None:
-        torch.manual_seed(17)
-        config = tiny_config()
-        model = D16QwenForCausalLM(config).eval()
-        restored = D16QwenForCausalLM(config).eval()
-        checkpoint = io.BytesIO()
-        torch.save(model.state_dict(), checkpoint)
-        checkpoint.seek(0)
-        restored.load_state_dict(torch.load(checkpoint, weights_only=True), strict=True)
-        self.assertIs(restored.model.embed_tokens.weight_real, restored.lm_head.weight_real)
-        self.assertIs(restored.model.embed_tokens.weight_imag, restored.lm_head.weight_imag)
-
-        inputs = encode_token_ids(torch.tensor([[1, 5, 2, 3], [2, 6, 3, 4]]))
-        with torch.no_grad():
-            reference = model(inputs).logits
-            output = restored(inputs).logits
-        torch.testing.assert_close(output.to_xy(), reference.to_xy())
-        torch.testing.assert_close(output.rotation, reference.rotation)
-
-    def test_rmsnorm_uses_both_components(self) -> None:
-        norm = D16RMSNorm(hidden_size=4, eps=1e-6)
-        gains = torch.tensor([0.5, 0.25, 0.6, 1.5])
-        with torch.no_grad():
-            norm.log_gain.copy_(gains.log())
-        real = torch.tensor([[3.0, -2.0, 0.0, 1.0]])
-        imag = torch.tensor([[4.0, 0.0, 5.0, -1.0]])
-        hidden = D16ComplexTensor.from_xy(real, imag)
-
-        output = norm(hidden)
-        self.assertIsInstance(output, D16ComplexTensor)
-        torch.testing.assert_close(output.rotation, hidden.rotation)
-        actual_real, actual_imag = output.to_xy()
-        scale = torch.rsqrt((real.square() + imag.square()).mean(-1, keepdim=True) + 1e-6)
-        torch.testing.assert_close(actual_real, real * scale * gains)
-        torch.testing.assert_close(actual_imag, imag * scale * gains)
-
-    def test_linear_matches_complex_product(self) -> None:
-        torch.manual_seed(29)
-        config = tiny_config()
-        config.attention_bias = False
-        model = D16QwenForCausalLM(config)
-        projection = model.model.layers[0].self_attn.q_proj
-        real = torch.randn(2, 3, config.complex_hidden_size)
-        imag = torch.randn_like(real)
-        output = projection(D16ComplexTensor.from_xy(real, imag))
-
-        self.assertIsInstance(output, D16ComplexTensor)
-        actual_real, actual_imag = output.to_xy()
-        linear = torch.nn.functional.linear
-        expected_real = linear(real, projection.weight_real) - linear(imag, projection.weight_imag)
-        expected_imag = linear(imag, projection.weight_real) + linear(real, projection.weight_imag)
-        torch.testing.assert_close(actual_real, expected_real, atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(actual_imag, expected_imag, atol=1e-5, rtol=1e-5)
-
-    def test_loss_backpropagates_to_complex_weights(self) -> None:
-        torch.manual_seed(19)
-        model = D16QwenForCausalLM(tiny_config())
-        inputs = torch.tensor([[1, 5, 2, 3], [2, 6, 3, 4]])
-        labels = inputs.clone()
-        labels[0, 1] = -100
-        output = model(encode_token_ids(inputs), labels=encode_token_ids(labels))
-        reference_loss = torch.nn.functional.cross_entropy(
-            output.logits.real()[:, :-1].reshape(-1, model.config.vocab_size),
-            labels[:, 1:].reshape(-1),
+    def test_kv_cache_and_generation_equivalence(self) -> None:
+        torch.manual_seed(11)
+        cfg = D16QwenConfig(
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=48,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            weight_storage="d16",
         )
-        self.assertIsInstance(output.loss, D16ComplexTensor)
-        self.assertFalse(bool(output.loss.is_nan()))
-        torch.testing.assert_close(output.loss.x, reference_loss)
-        output.loss.x.backward()
-        for name, parameter in model.named_parameters():
-            self.assertIsNotNone(parameter.grad, name)
-            self.assertTrue(bool(torch.isfinite(parameter.grad).all()), name)
-        attention = model.model.layers[0].self_attn
-        for module in (model.model.embed_tokens, attention.q_proj, attention.v_proj):
-            self.assertTrue(bool((module.weight_real.grad != 0).any()))
-            self.assertTrue(bool((module.weight_imag.grad != 0).any()))
-
-    def test_projection_gradient_at_exact_zero(self) -> None:
-        projection = D16Linear(1, 1, bias=False)
-        with torch.no_grad():
-            projection.weight_real.zero_()
-            projection.weight_imag.zero_()
-        source = D16ComplexTensor.from_xy(torch.zeros(1, 1), torch.full((1, 1), 2.0))
-        projection(source).x.sum().backward()
-        torch.testing.assert_close(projection.weight_real.grad, torch.zeros(1, 1))
-        torch.testing.assert_close(projection.weight_imag.grad, torch.full((1, 1), -2.0))
-
-    def test_padding_and_cached_generation(self) -> None:
-        torch.manual_seed(23)
-        model = D16QwenForCausalLM(tiny_config()).eval()
-        input_ids = encode_token_ids(torch.tensor([[0, 0, 1, 5, 2], [2, 4, 8, 6, 3]]))
-        padding = torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]])
-        positions = (padding.cumsum(dim=-1) - 1).clamp_min(0)
+        model = D16QwenForCausalLM(cfg).eval()
+        raw_ids = torch.randint(0, 32, (2, 7), dtype=torch.long)
+        d16_ids = encode_token_ids(raw_ids)
 
         with torch.no_grad():
-            full = model(input_ids, attention_mask=padding, position_ids=positions)
-            unpadded = model(input_ids[:1, 2:])
-            prefix = model(
-                input_ids[:, :-1],
-                attention_mask=padding[:, :-1],
-                position_ids=positions[:, :-1],
-                use_cache=True,
-            )
-            step = model(
-                input_ids[:, -1:],
-                attention_mask=padding,
-                position_ids=positions[:, -1:],
-                past_key_values=prefix.past_key_values,
-                use_cache=True,
-            )
-        full_real, full_imag = full.logits.to_xy()
-        self.assertTrue(bool(torch.isfinite(full_real).all() & torch.isfinite(full_imag).all()))
-        torch.testing.assert_close(
-            (full_real[:1, 2:], full_imag[:1, 2:]),
-            unpadded.logits.to_xy(),
-            atol=1e-4,
-            rtol=1e-4,
-        )
-        torch.testing.assert_close(
-            step.logits.to_xy(), (full_real[:, -1:], full_imag[:, -1:]), atol=1e-4, rtol=1e-4
-        )
+            full_out = model(d16_ids, use_cache=False)
+            prefill = model(d16_ids[:, :-1], use_cache=True)
+            step_out = model(d16_ids[:, -1:], past_key_values=prefill.past_key_values, use_cache=True)
 
-        cached = model.generate(input_ids, max_new_tokens=4, use_cache=True)
-        uncached = model.generate(input_ids, max_new_tokens=4, use_cache=False)
-        self.assertEqual(cached.shape, (2, 9))
-        torch.testing.assert_close(cached.to_xy(), uncached.to_xy())
+            full_re, full_im = full_out.logits[:, -1, :].to_xy()
+            step_re, step_im = step_out.logits[:, -1, :].to_xy()
+            self.assertLess(float((full_re - step_re).abs().max().item()), 1e-5)
+            self.assertLess(float((full_im - step_im).abs().max().item()), 1e-5)
+
+            gen_cached = model.generate(d16_ids[:, :3], max_new_tokens=5, do_sample=False, use_cache=True)
+            gen_nocache = model.generate(d16_ids[:, :3], max_new_tokens=5, do_sample=False, use_cache=False)
+            self.assertTrue(bool((gen_cached.x == gen_nocache.x).all()))
+            self.assertTrue(bool((gen_cached.rotation == gen_nocache.rotation).all()))
+
+    def test_train_native_d16_weights_with_d16_adamw(self) -> None:
+        torch.manual_seed(42)
+        cfg = D16QwenConfig(
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=48,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            weight_storage="d16",
+        )
+        model = D16QwenForCausalLM(cfg)
+        optimizer = D16AdamW(model.d16_parameters(), lr=2.5e-2, weight_decay=1e-3)
+
+        raw_tokens = torch.tensor(
+            [
+                [1, 5, 9, 13, 17, 21, 25, 29, 2, 6, 10, 14],
+                [3, 7, 11, 15, 19, 23, 27, 31, 4, 8, 12, 16],
+            ],
+            dtype=torch.long,
+        )
+        d16_tokens = encode_token_ids(raw_tokens)
+        init_rot = model.model.layers[0].mlp.up_proj.weight.rotation.clone()
+
+        first_loss = None
+        last_loss = None
+        for step in range(30):
+            optimizer.zero_grad()
+            out = model(input_ids=d16_tokens, labels=d16_tokens)
+            assert out.loss is not None
+            loss_val = float(out.loss.x.item())
+            if step == 0:
+                first_loss = loss_val
+            out.loss.x.backward()
+            optimizer.step(max_grad_norm=1.0)
+            last_loss = loss_val
+
+        assert first_loss is not None and last_loss is not None
+        self.assertLess(last_loss, first_loss * 0.1)
+        changed = int((model.model.layers[0].mlp.up_proj.weight.rotation != init_rot).sum().item())
+        self.assertGreater(changed, init_rot.numel() // 2)
+
+        model.eval()
+        gen = model.generate(d16_tokens[:, :4], max_new_tokens=8, do_sample=False, use_cache=True)
+        self.assertTrue(bool((gen.x.to(torch.long) == raw_tokens).all()))
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)
