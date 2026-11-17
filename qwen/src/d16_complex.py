@@ -1551,9 +1551,11 @@ if _HAS_TORCH:
             else:
                 eff_active = active
 
-            max_val = torch.where(eff_active, strength, -float("inf")).amax(dim=-1, keepdim=True)
+            masked_strength = torch.where(eff_active, strength, -float("inf"))
+            max_val = masked_strength.amax(dim=-1, keepdim=True)
             max_val = torch.where(torch.isfinite(max_val), max_val, 0.0)
-            terms = torch.where(eff_active, (strength - max_val).exp(), 0.0)
+            shifted = torch.where(eff_active, strength - max_val, -float("inf"))
+            terms = shifted.exp()
             probabilities = (terms / terms.sum(dim=-1, keepdim=True).clamp_min(1.0)).to(self.dtype)
             return _real_magnitude(probabilities, torch.zeros_like(undefined), undefined.any(dim=-1, keepdim=True))
 

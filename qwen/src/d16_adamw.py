@@ -176,14 +176,16 @@ class D16AdamW:
             delta = first * (step_size / denom)
             updated = weight * decay - delta
 
-            if self._should_apply_indiff_threshold(parameter):
-                updated = updated.apply_Manifold_Threshold_L1(
-                    self.indiff_eps, rel=self.indiff_rel, dim=None
-                )
-
             parameter.copy_(updated.round_to_dtype(stored_weight.dtype), index=index)
             moments.first.copy_slice_(index, first)
             moments.second.copy_slice_(index, second)
+
+        if self._should_apply_indiff_threshold(parameter):
+            parameter.copy_(
+                parameter.value().apply_Manifold_Threshold_L1(
+                    self.indiff_eps, rel=self.indiff_rel, dim=None
+                )
+            )
 
     def state_dict(self) -> dict:
         """Serialize optimizer moments using tensors and primitive metadata."""
