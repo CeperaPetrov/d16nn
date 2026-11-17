@@ -1257,7 +1257,7 @@ if _HAS_TORCH:
             nx = self.x.to(*args, **kwargs)
             ny = self.y.to(*args, **kwargs)
             nrot = self.rotation.to(device=nx.device)
-            undefined = self.is_nan() | ~torch.isfinite(nx) | ~torch.isfinite(ny)
+            undefined = (nrot == MASK_NAN) | ~torch.isfinite(nx) | ~torch.isfinite(ny)
             if bool(undefined.any()):
                 nx = nx.masked_fill(undefined, 0.0)
                 ny = ny.masked_fill(undefined, 0.0)
@@ -1373,7 +1373,7 @@ if _HAS_TORCH:
             else:
                 threshold = eps
             re, im = self.unpack()
-            return self.to_indifferent_where((re.abs() + im.abs()) <= threshold)
+            return self.to_indifferent_where(((re.abs() + im.abs()) <= threshold) & ~self.is_nan())
 
         # --- Dihedral & Algebraic Operations (Autograd-Enabled) ---
 
@@ -1541,9 +1541,11 @@ if _HAS_TORCH:
             if allowed is not None:
                 undefined = undefined & allowed
 
-            has_cutoff = (isinstance(eps, str) and eps == "auto" and rel > 0.0) or (
-                isinstance(eps, (int, float)) and eps > 0.0
-            )
+            has_cutoff = (
+                (isinstance(eps, str) and eps == "auto" and rel > 0.0) 
+                or (isinstance(eps, (int, float)) and eps > 0.0)
+                or isinstance(eps, torch.Tensor)
+            ) 
             if has_cutoff:
                 above_cutoff = active & (strength > 0.0)
                 has_survivor = above_cutoff.any(dim=-1, keepdim=True)
@@ -1583,14 +1585,32 @@ if _HAS_TORCH:
             """Mean negative log-likelihood from rotation-free wedge signal strength (x, y)."""
             undefined = self.is_nan()
             strength = self.wedge_strength(eps=eps, rel=rel)
+            active = ~undefined
             valid = targets != -100
             addresses = targets.masked_fill(~valid, 0).unsqueeze(-1)
             selected = strength.gather(-1, addresses).squeeze(-1)
 
-            max_val = strength.masked_fill(undefined, -float("inf")).amax(dim=-1, keepdim=True)
+            has_cutoff = (
+                (isinstance(eps, str) and eps == "auto" and rel > 0.0)
+                or (isinstance(eps, (int, float)) and eps > 0.0)
+                or isinstance(eps, torch.Tensor)
+            )
+            if has_cutoff:
+                above_cutoff = active & (strength > 0.0)
+                has_survivor = above_cutoff.any(dim=-1, keepdim=True)
+                eff_active = torch.where(has_survivor, above_cutoff, active)
+            else:
+                eff_active = active
+
+            target_mask = torch.zeros_like(eff_active).scatter_(-1, addresses, valid.unsqueeze(-1))
+            eff_active = eff_active | (target_mask & active)
+
+            masked_strength = torch.where(eff_active, strength, -float("inf"))
+            max_val = masked_strength.amax(dim=-1, keepdim=True)
             max_val = torch.where(torch.isfinite(max_val), max_val, 0.0)
-            terms = torch.where(~undefined, (strength - max_val).exp(), 0.0)
-            losses = (terms.sum(dim=-1).log() + max_val.squeeze(-1)) - selected
+            shifted = torch.where(eff_active, strength - max_val, -float("inf"))
+            terms = shifted.exp()
+            losses = (terms.sum(dim=-1).clamp_min(1e-12).log() + max_val.squeeze(-1)) - selected
             mean = (losses.masked_fill(~valid, 0.0).sum() / valid.sum()).masked_fill(
                 (undefined.any(dim=-1) & valid).any(), float("nan")
             )
