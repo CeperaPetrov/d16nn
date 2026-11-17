@@ -1321,6 +1321,12 @@ if _HAS_TORCH:
             return D16ComplexTensor(self.x[index], self.y[index], self.rotation[index])
 
         def copy_slice_(self, index, value: "D16ComplexTensor") -> "D16ComplexTensor":
+            if 0 in self.x.stride():
+                self.x = self.x.clone()
+            if 0 in self.y.stride():
+                self.y = self.y.clone()
+            if 0 in self.rotation.stride():
+                self.rotation = self.rotation.clone()
             self.x[index].copy_(value.x)
             self.y[index].copy_(value.y)
             self.rotation[index].copy_(value.rotation)
@@ -1493,6 +1499,7 @@ if _HAS_TORCH:
 
         def wedge_strength(
             self,
+            allowed: Optional[torch.Tensor] = None,
             *,
             eps: Union[float, torch.Tensor, str] = 0.0,
             rel: float = 0.25,
@@ -1500,13 +1507,17 @@ if _HAS_TORCH:
             """Compute rotation-free signal strength from wedge coordinates (x, y) with weak-signal cutoff."""
             dtype = torch.float32 if self.dtype in (torch.float16, torch.bfloat16) else self.dtype
             x, y = self.x.to(dtype), self.y.to(dtype)
+            undefined = self.is_nan()
+            active = ~undefined if allowed is None else (allowed & ~undefined)
             strength = (x.square() + y.square() + 1e-12).sqrt() - 1e-6
 
             if isinstance(eps, str):
                 if eps != "auto":
                     raise ValueError(f"Unknown wedge threshold mode: {eps!r}")
                 if rel > 0.0:
-                    rms = (x.square() + y.square()).mean(dim=-1, keepdim=True).sqrt()
+                    sq = torch.where(active, x.square() + y.square(), 0.0)
+                    denom = active.sum(dim=-1, keepdim=True).clamp_min(1)
+                    rms = (sq.sum(dim=-1, keepdim=True) / denom).sqrt()
                     thresh = rms * rel
                     strength = torch.where(strength <= thresh, torch.zeros_like(strength), strength)
             elif isinstance(eps, (int, float)):
@@ -1515,7 +1526,7 @@ if _HAS_TORCH:
             else:
                 strength = torch.where(strength <= eps, torch.zeros_like(strength), strength)
 
-            return strength.masked_fill(self.is_nan(), float("nan"))
+            return strength.masked_fill(undefined, float("nan"))
 
         def wedge_softmax(
             self,
@@ -1528,7 +1539,7 @@ if _HAS_TORCH:
             if self.shape[-1] == 0:
                 return self
             undefined = self.is_nan()
-            strength = self.wedge_strength(eps=eps, rel=rel)
+            strength = self.wedge_strength(allowed, eps=eps, rel=rel)
             active = ~undefined if allowed is None else (allowed & ~undefined)
             if allowed is not None:
                 undefined = undefined & allowed

@@ -101,6 +101,8 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
             num_attention_heads=4,
             num_key_value_heads=2,
             weight_storage="d16",
+            indiff_eps="auto",
+            indiff_rel=0.65,
         )
         model = D16QwenForCausalLM(cfg).eval()
         raw_ids = torch.randint(0, 32, (2, 7), dtype=torch.long)
@@ -110,6 +112,12 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
             full_out = model(d16_ids, use_cache=False)
             prefill = model(d16_ids[:, :-1], use_cache=True)
             step_out = model(d16_ids[:, -1:], past_key_values=prefill.past_key_values, use_cache=True)
+
+            # Verify prefix causal invariance (future tokens must not leak into auto threshold)
+            prefix_re, prefix_im = prefill.logits.to_xy()
+            full_pref_re, full_pref_im = full_out.logits[:, :-1, :].to_xy()
+            self.assertLess(float((full_pref_re - prefix_re).abs().max().item()), 1e-5)
+            self.assertLess(float((full_pref_im - prefix_im).abs().max().item()), 1e-5)
 
             full_re, full_im = full_out.logits[:, -1, :].to_xy()
             step_re, step_im = step_out.logits[:, -1, :].to_xy()
@@ -263,6 +271,11 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
             sd = optimizer.state_dict()
             self.assertEqual(sd["indiff_eps"], mode_eps)
             optimizer.load_state_dict(sd)
+            # Verify restored optimizer can execute a subsequent step without stride-0 copy errors
+            optimizer.zero_grad()
+            out_after = model(input_ids=d16_tokens, labels=d16_tokens)
+            out_after.loss.x.backward()
+            optimizer.step(max_grad_norm=1.0)
 
             up_w = model.model.layers[0].mlp.up_proj.weight.value()
             indiff_count = int(up_w.is_zero().sum().item())

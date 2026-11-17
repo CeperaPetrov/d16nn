@@ -129,8 +129,6 @@ class D16Linear(nn.Module):
         weight: D16ComplexTensor,
         bias: Optional[D16ComplexTensor],
         dtype: torch.dtype,
-        eps: IndiffThreshold,
-        rel: float,
     ) -> D16ComplexTensor:
         wr, wi = weight.map_tensors(lambda t: t.transpose(0, 1)).to(re.dtype).unpack()
         out_re = re.real_matmul(wr).real_sub(im.real_matmul(wi))
@@ -138,8 +136,6 @@ class D16Linear(nn.Module):
         z = D16ComplexTensor.pack(out_re, out_im)
         if bias is not None:
             z = z + bias.to(re.dtype)
-        if eps == "auto" or (isinstance(eps, (int, float)) and eps > 0):
-            z = z.apply_Manifold_Threshold_L1(eps, rel=rel, dim=-1)
         return z.to(dtype)
 
     def _project_cartesian_tile(
@@ -151,8 +147,6 @@ class D16Linear(nn.Module):
         bias_real: Optional[torch.Tensor],
         bias_imag: Optional[torch.Tensor],
         dtype: torch.dtype,
-        eps: IndiffThreshold,
-        rel: float,
     ) -> D16ComplexTensor:
         weight = D16ComplexTensor.encode_coordinates(weight_real.to(re.dtype), weight_imag.to(re.dtype))
         bias = (
@@ -160,7 +154,7 @@ class D16Linear(nn.Module):
             if bias_real is None
             else D16ComplexTensor.encode_coordinates(bias_real.to(re.dtype), bias_imag.to(re.dtype))
         )
-        return self._project_tile(re, im, weight, bias, dtype, eps, rel)
+        return self._project_tile(re, im, weight, bias, dtype)
 
     def forward(
         self,
@@ -190,16 +184,17 @@ class D16Linear(nn.Module):
             )
         recompute = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         for parameter_tile in parameter_tiles:
-            args = (re, im, *parameter_tile, dtype, eps, rel)
+            args = (re, im, *parameter_tile, dtype)
             if recompute:
                 z = checkpoint(project, *args, use_reentrant=False, preserve_rng_state=False)
             else:
                 z = project(*args)
             tiles.append(z)
 
-        if len(tiles) == 1:
-            return tiles[0]
-        return D16ComplexTensor.cat(tiles, dim=-1)
+        out = tiles[0] if len(tiles) == 1 else D16ComplexTensor.cat(tiles, dim=-1)
+        if eps == "auto" or (isinstance(eps, (int, float)) and eps > 0):
+            out = out.apply_Manifold_Threshold_L1(eps, rel=rel, dim=-1)
+        return out
 
 
 class D16Embedding(nn.Module):

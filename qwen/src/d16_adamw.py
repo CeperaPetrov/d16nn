@@ -231,7 +231,7 @@ class D16AdamW:
             )
             rotation = entry["first_rotation"].to(device=device, copy=True)
             first = D16ComplexTensor(first_x, first_y, rotation)
-            second = D16ComplexTensor.from_real(second_r)
+            second = D16ComplexTensor.from_real(second_r).clone()
             restored.append(_Moments(entry["step"], first, second))
         self._set_options(
             state_dict["lr"],

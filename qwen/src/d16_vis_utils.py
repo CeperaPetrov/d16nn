@@ -19,7 +19,10 @@ from torch import nn
 
 from d16_complex import D16Complex, D16ComplexTensor, STATE_LABELS, TAN_PI_8
 from d16_parameter import D16Parameter
-from d16_qwen_converter import ConversionReport, LayerOrbitReport
+try:
+    from d16_qwen_converter import ConversionReport, LayerOrbitReport
+except ImportError:  # pragma: no cover
+    ConversionReport = LayerOrbitReport = object  # type: ignore[misc,assignment]
 from d16_qwen_model import D16QwenMLP
 
 
@@ -771,6 +774,111 @@ def plot_d16_synapse_polar_trajectories(recorder: D16TrajectoryRecorder):
     return fig
 
 
+# =====================================================================
+# 4. ATTENTION HEATMAP VISUALIZATION (SPARSITY & 0xFFFF MASK INSPECTION)
+# =====================================================================
+
+def plot_d16_attention_heatmap(
+    model: nn.Module,
+    d16_tokens: D16ComplexTensor,
+    layer_idx: int = 0,
+    head_idx: int = 0,
+    batch_idx: int = 0,
+):
+    """Plot the attention weight heatmap and highlight 0xFFFF (Indifferent / Zero) sparse links."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    model.eval()
+    captured_weights = None
+    captured_zero = None
+    captured_allowed = None
+
+    attn = model.model.layers[layer_idx].self_attn
+    orig_fw = attn.forward
+
+    def hook_forward(hidden_states, position_embeddings, attention_mask=None, past_key_value=None, use_cache=False):
+        nonlocal captured_weights, captured_zero, captured_allowed
+        batch, length, _ = hidden_states.shape
+        head_dim, kv_heads = attn.head_dim, attn.num_kv_heads
+        query = attn.q_proj(hidden_states).map_tensors(
+            lambda t: t.reshape(batch, length, kv_heads, attn.num_groups, head_dim).permute(0, 2, 3, 1, 4)
+        )
+        key = attn.k_proj(hidden_states).map_tensors(
+            lambda t: t.reshape(batch, length, kv_heads, head_dim).transpose(1, 2)
+        )
+        key_phases = position_embeddings.map_tensors(lambda t: t[:, None, :, :])
+        query_phases = key_phases.map_tensors(lambda t: t.unsqueeze(2))
+        query = query * query_phases
+        key = key * key_phases
+
+        dtype = torch.float64 if query.dtype == torch.float64 else torch.float32
+        q_re, q_im = query.to(dtype).unpack()
+        k_re, k_im = key.to(dtype).map_tensors(lambda t: t.transpose(-1, -2).unsqueeze(2)).unpack()
+        scores_re = q_re.real_matmul(k_re).real_add(q_im.real_matmul(k_im))
+        scores_im = q_im.real_matmul(k_re).real_sub(q_re.real_matmul(k_im))
+        scores = D16ComplexTensor.pack(scores_re, scores_im) * (head_dim ** -0.5)
+        allowed = None if attention_mask is None else attention_mask.unsqueeze(2)
+        weights = scores.wedge_softmax(allowed, eps=attn.indiff_eps, rel=attn.indiff_rel)
+
+        kv_idx = head_idx // attn.num_groups
+        grp_idx = head_idx % attn.num_groups
+        captured_weights = weights.x[batch_idx, kv_idx, grp_idx].detach().cpu().numpy()
+        captured_zero = weights.is_zero()[batch_idx, kv_idx, grp_idx].detach().cpu().numpy()
+        if allowed is not None:
+            allowed_exp = allowed.expand_as(weights.x)
+            captured_allowed = allowed_exp[batch_idx, kv_idx, grp_idx].detach().cpu().numpy()
+        else:
+            captured_allowed = np.ones_like(captured_zero, dtype=bool)
+        return orig_fw(hidden_states, position_embeddings, attention_mask, past_key_value, use_cache)
+
+    attn.forward = hook_forward
+    try:
+        with torch.no_grad():
+            _ = model(input_ids=d16_tokens)
+    finally:
+        attn.forward = orig_fw
+
+    if captured_weights is None or captured_zero is None or captured_allowed is None:
+        raise RuntimeError("Attention forward hook was not triggered")
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13.5, 5.5))
+
+    im1 = ax1.imshow(captured_weights, cmap="viridis", aspect="auto", vmin=0.0)
+    fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04, label="Вероятность внимания weights.x")
+    ax1.set_xlabel("Ключ (Key token index)")
+    ax1.set_ylabel("Запрос (Query token index)")
+    ax1.set_title(
+        f"Слой {layer_idx}, Голова {head_idx} | Веса wedge_softmax(x, y)\n"
+        f"(indiff_eps={attn.indiff_eps!r}, indiff_rel={attn.indiff_rel})"
+    )
+
+    # Map states on the causal triangle:
+    # 0.0 = causal future mask (upper triangle), 0.5 = active link (0x8001), 1.0 = causal link pruned to 0xFFFF
+    pruned_causal = captured_allowed & captured_zero
+    active_causal = captured_allowed & (~captured_zero)
+    state_map = np.zeros_like(captured_weights, dtype=float)
+    state_map[active_causal] = 0.5
+    state_map[pruned_causal] = 1.0
+
+    im2 = ax2.imshow(state_map, cmap="YlOrRd", aspect="auto", vmin=0.0, vmax=1.0)
+    cbar2 = fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04, ticks=[0.0, 0.5, 1.0])
+    cbar2.ax.set_yticklabels(["Causal mask", "Активна (0x8001)", "Отсечена (0xFFFF)"])
+    ax2.set_xlabel("Ключ (Key token index)")
+    ax2.set_ylabel("Запрос (Query token index)")
+
+    pruned_cnt = int(pruned_causal.sum())
+    causal_cnt = int(captured_allowed.sum())
+    pruned_pct = 100.0 * pruned_cnt / max(causal_cnt, 1)
+    ax2.set_title(
+        f"Отсечка шума в 0xFFFF внутри причинного треугольника\n"
+        f"({pruned_cnt}/{causal_cnt} каузальных связей = {pruned_pct:.1f}% в 0xFFFF)"
+    )
+
+    plt.tight_layout()
+    return fig
+
+
 __all__ = [
     "print_orbit_table",
     "plot_single_orbit_compass",
@@ -784,4 +892,5 @@ __all__ = [
     "print_d16_trajectory_summary",
     "plot_d16_sector_trajectories",
     "plot_d16_synapse_polar_trajectories",
+    "plot_d16_attention_heatmap",
 ]
