@@ -1,4 +1,4 @@
-"""Complex Qwen decoder with D16 wedge coordinates throughout the forward pass.
+"""Standalone Complex Qwen decoder with D16 wedge coordinates throughout the forward pass.
 
 A hidden width of 896 represents 448 complex channels. The model accepts
 real-axis D16 token IDs of shape [batch, sequence]. Use encode_token_ids to
@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import repeat
 import math
-from typing import Callable, Literal, Optional, Union
+from typing import Callable, Dict, Literal, Optional, Union
 
 import torch
 from torch import nn
@@ -22,11 +22,6 @@ from torch.utils.checkpoint import checkpoint
 
 from d16_complex import D16ComplexTensor
 from d16_parameter import D16Parameter
-from d16_qwen_model import (
-    D16QwenConfig as _QwenConfig,
-    D16QwenForCausalLM as _QwenControls,
-    _apply_sector_steering,
-)
 
 IndiffThreshold = float | Literal["auto"]
 MLPActivation = Union[
@@ -62,12 +57,28 @@ def _token_addresses(
 
 
 @dataclass
-class D16QwenConfig(_QwenConfig):
-    """Hidden size counts real coordinates, two per complex channel."""
+class D16QwenConfig:
+    """Configuration for standalone native D16QwenModel and D16QwenForCausalLM.
+
+    Hidden size counts real coordinates, two per complex channel.
+    """
+
+    vocab_size: int = 151936
+    hidden_size: int = 896
+    intermediate_size: int = 4864
+    num_hidden_layers: int = 24
+    num_attention_heads: int = 14
+    num_key_value_heads: int = 2
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 1000000.0
+    tie_word_embeddings: bool = True
+    attention_bias: bool = True
+    mlp_bias: bool = False
 
     indiff_eps: IndiffThreshold = 0.0
     indiff_rel: float = 0.25
     mlp_activation: MLPActivation = "sigmoid"
+    collect_d16_stats: bool = False
 
     @property
     def complex_hidden_size(self) -> int:
@@ -284,9 +295,6 @@ class D16QwenMLP(nn.Module):
         self.indiff_eps: IndiffThreshold = config.indiff_eps
         self.indiff_rel: float = config.indiff_rel
         self.collect_stats = config.collect_d16_stats
-        self.steer_mode = "identity"
-        self.steer_shift = 0
-        self.steer_channels: Optional[torch.Tensor] = None
         self.register_buffer("state_counts", torch.zeros(18, dtype=torch.long), persistent=False)
         self.total_elements = 0
         self.indifferent_elements = 0
@@ -298,11 +306,6 @@ class D16QwenMLP(nn.Module):
 
     def forward(self, hidden_states: D16ComplexTensor) -> D16ComplexTensor:
         z = self.up_proj(hidden_states, eps=self.indiff_eps, rel=self.indiff_rel)
-        if self.steer_mode != "identity":
-            channels = self.steer_channels
-            if channels is not None:
-                channels = channels.to(z.device)
-            z = _apply_sector_steering(z, self.steer_mode, self.steer_shift, channels)
 
         if self.collect_stats:
             with torch.no_grad():
@@ -418,11 +421,11 @@ class D16CausalLMOutput:
     loss: Optional[D16ComplexTensor] = None
 
 
-class D16QwenForCausalLM(_QwenControls):
-    """D16 language model with a complex readout at each vocabulary position."""
+class D16QwenForCausalLM(nn.Module):
+    """Standalone D16 language model with a complex readout at each vocabulary position."""
 
     def __init__(self, config: D16QwenConfig) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.config = config
         self.model = D16QwenModel(config)
         shared_weight = (
@@ -511,6 +514,46 @@ class D16QwenForCausalLM(_QwenControls):
             return generated
         finally:
             self.train(was_training)
+
+    # --- D16 Telemetry & Indifferent Sparsity Controls ---
+
+    def set_indifferent_threshold(
+        self, eps: IndiffThreshold, rel: Optional[float] = None
+    ) -> None:
+        if eps != "auto" and (not isinstance(eps, (int, float)) or float(eps) < 0.0):
+            raise ValueError("eps must be a nonnegative float or 'auto'")
+        self.config.indiff_eps = eps
+        if rel is not None:
+            self.config.indiff_rel = float(rel)
+        for layer in self.model.layers:
+            layer.mlp.indiff_eps = eps
+            layer.self_attn.indiff_eps = eps
+            if rel is not None:
+                layer.mlp.indiff_rel = float(rel)
+                layer.self_attn.indiff_rel = float(rel)
+
+    def set_collect_d16_stats(self, enabled: bool = True, reset: bool = True) -> None:
+        self.config.collect_d16_stats = enabled
+        for layer in self.model.layers:
+            layer.mlp.collect_stats = enabled
+            if reset:
+                layer.mlp.reset_stats()
+
+    def get_d16_state_summary(self) -> Dict[str, Union[torch.Tensor, float, int]]:
+        total_counts = torch.zeros(18, dtype=torch.long)
+        total_elems = 0
+        indiff_elems = 0
+        for layer in self.model.layers:
+            total_counts += layer.mlp.state_counts.cpu()
+            total_elems += layer.mlp.total_elements
+            indiff_elems += layer.mlp.indifferent_elements
+        sparsity_pct = (indiff_elems / max(total_elems, 1)) * 100.0
+        return {
+            "state_counts": total_counts,
+            "total_elements": total_elems,
+            "indifferent_elements": indiff_elems,
+            "indifferent_pct": sparsity_pct,
+        }
 
 
 __all__ = [

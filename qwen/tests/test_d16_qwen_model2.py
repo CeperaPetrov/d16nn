@@ -57,6 +57,17 @@ class TestD16EncapsulationAndAutograd(unittest.TestCase):
             tree = ast.parse(fpath.read_text(encoding="utf-8"), filename=fname)
             used_names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
             self.assertEqual(used_names & banned_names, set())
+            imported_modules = {
+                node.module
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom) and node.module is not None
+            } | {
+                alias.name
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Import)
+                for alias in node.names
+            }
+            self.assertNotIn("d16_qwen_model", imported_modules)
 
     def test_d16_complex_tensor_autograd_add_mul_sub(self) -> None:
         torch.manual_seed(7)
