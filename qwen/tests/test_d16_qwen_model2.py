@@ -168,5 +168,54 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
         self.assertTrue(bool((gen.x.to(torch.long) == raw_tokens).all()))
 
 
+    def test_d16_adamw_manual_and_auto_indiff_eps(self) -> None:
+        for mode_eps in (0.04, "auto"):
+            torch.manual_seed(42)
+            cfg = D16QwenConfig(
+                vocab_size=32,
+                hidden_size=32,
+                intermediate_size=48,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                weight_storage="d16",
+                indiff_eps=0.15,
+            )
+            model = D16QwenForCausalLM(cfg)
+            optimizer = D16AdamW(
+                model.d16_parameters(),
+                lr=2.5e-2,
+                weight_decay=1e-3,
+                indiff_eps=mode_eps,
+                indiff_rel=0.30,
+            )
+            raw_tokens = torch.tensor(
+                [
+                    [1, 5, 9, 13, 17, 21, 25, 29, 2, 6, 10, 14],
+                    [3, 7, 11, 15, 19, 23, 27, 31, 4, 8, 12, 16],
+                ],
+                dtype=torch.long,
+            )
+            d16_tokens = encode_token_ids(raw_tokens)
+
+            for _ in range(30):
+                optimizer.zero_grad()
+                out = model(input_ids=d16_tokens, labels=d16_tokens)
+                out.loss.x.backward()
+                optimizer.step(max_grad_norm=1.0)
+
+            sd = optimizer.state_dict()
+            self.assertEqual(sd["indiff_eps"], mode_eps)
+            optimizer.load_state_dict(sd)
+
+            up_w = model.model.layers[0].mlp.up_proj.weight.value()
+            indiff_count = int(up_w.is_zero().sum().item())
+            self.assertGreater(indiff_count, 0)
+
+            model.eval()
+            gen = model.generate(d16_tokens[:, :4], max_new_tokens=8, do_sample=False, use_cache=True)
+            self.assertTrue(bool((gen.x.to(torch.long) == raw_tokens).all()))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

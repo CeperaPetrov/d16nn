@@ -4,11 +4,14 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 import math
+from typing import Literal
 
 import torch
 
 from d16_complex import D16ComplexTensor
 from d16_parameter import D16Parameter
+
+IndiffThreshold = float | Literal["auto"]
 
 
 @dataclass
@@ -36,6 +39,17 @@ class D16AdamW:
     Second moments are real-axis D16ComplexTensor objects accumulated via real_add.
     Weight updates and decay are executed via D16 multiplication and subtraction,
     automatically updating sector masks inside D16ComplexTensor.
+
+    Parameters
+    ----------
+    indiff_eps : float or "auto", default 0.0
+        L1 manifold threshold for snapping small complex weights into State 16:
+        Indifferent (0xFFFF) after each update step:
+        - float >= 0.0 : manual fixed threshold (0.0 disables pruning).
+        - "auto"       : automatic per-tensor adaptive threshold equal to
+                         `indiff_rel * sqrt(mean(|w|^2))`.
+    indiff_rel : float, default 0.25
+        Relative RMS multiplier used when `indiff_eps="auto"`.
     """
 
     def __init__(
@@ -46,6 +60,8 @@ class D16AdamW:
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.01,
+        indiff_eps: IndiffThreshold = 0.0,
+        indiff_rel: float = 0.25,
         tile_size: int = 1 << 20,
     ) -> None:
         self.parameters = tuple(dict.fromkeys(parameters))
@@ -55,16 +71,33 @@ class D16AdamW:
             raise TypeError("D16AdamW only accepts D16Parameter modules")
         if tile_size <= 0:
             raise ValueError("tile_size must be positive")
-        self._set_options(lr, betas, eps, weight_decay)
+        self._set_options(lr, betas, eps, weight_decay, indiff_eps, indiff_rel)
         self.tile_size = tile_size
         self._moments: list[_Moments | None] = [None] * len(self.parameters)
 
-    def _set_options(self, lr, betas, eps, weight_decay) -> None:
-        if not all(0 <= value < math.inf for value in (lr, eps, weight_decay)):
-            raise ValueError("lr, eps and weight_decay must be nonnegative and finite")
+    def _set_options(
+        self,
+        lr: float,
+        betas: tuple[float, float],
+        eps: float,
+        weight_decay: float,
+        indiff_eps: IndiffThreshold = 0.0,
+        indiff_rel: float = 0.25,
+    ) -> None:
+        if not all(0 <= value < math.inf for value in (lr, eps, weight_decay, indiff_rel)):
+            raise ValueError("lr, eps, weight_decay and indiff_rel must be nonnegative and finite")
         if len(betas) != 2 or not all(0 <= beta < 1 for beta in betas):
             raise ValueError("Expected two betas in [0, 1)")
-        self.lr, self.betas, self.eps, self.weight_decay = lr, tuple(betas), eps, weight_decay
+        if indiff_eps != "auto":
+            if not isinstance(indiff_eps, (int, float)) or not (0.0 <= float(indiff_eps) < math.inf):
+                raise ValueError("indiff_eps must be a nonnegative finite float or 'auto'")
+            indiff_eps = float(indiff_eps)
+        self.lr = lr
+        self.betas = tuple(betas)
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.indiff_eps: IndiffThreshold = indiff_eps
+        self.indiff_rel = float(indiff_rel)
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         for parameter in self.parameters:
@@ -78,6 +111,19 @@ class D16AdamW:
         rows = max(1, self.tile_size // row_width)
         for start in range(0, parameter.x.shape[0], rows):
             yield slice(start, start + rows)
+
+    def _resolve_indiff_threshold(
+        self, updated: D16ComplexTensor, parameter: D16Parameter
+    ) -> float | torch.Tensor:
+        """Compute active 0xFFFF threshold for complex weights (skipping 1D real_only gains and biases)."""
+        if parameter.real_only or parameter.x.ndim < 2:
+            return 0.0
+        if self.indiff_eps == "auto":
+            if self.indiff_rel <= 0.0:
+                return 0.0
+            rms_radius = updated.norm_squared().mean().sqrt()
+            return rms_radius * self.indiff_rel
+        return self.indiff_eps
 
     @torch.no_grad()
     def step(self, max_grad_norm: float | None = None) -> torch.Tensor:
@@ -128,6 +174,7 @@ class D16AdamW:
             prev_first = moments.first[index]
             prev_second = moments.second[index]
 
+            # Pure D16ComplexTensor arithmetic:
             first = prev_first * beta1 + gradient * (1.0 - beta1)
             second = (prev_second * beta2).real_add(gradient.norm_squared_d16() * (1.0 - beta2))
 
@@ -135,6 +182,10 @@ class D16AdamW:
             denom = (second_radius / correction2).sqrt() + self.eps
             delta = first * (step_size / denom)
             updated = weight * decay - delta
+
+            threshold = self._resolve_indiff_threshold(updated, parameter)
+            if isinstance(threshold, torch.Tensor) or threshold > 0.0:
+                updated = updated.apply_Manifold_Threshold_L1(threshold)
 
             parameter.copy_(updated.round_to_dtype(stored_weight.dtype), index=index)
             moments.first.copy_slice_(index, first)
@@ -148,6 +199,8 @@ class D16AdamW:
             "betas": self.betas,
             "eps": self.eps,
             "weight_decay": self.weight_decay,
+            "indiff_eps": self.indiff_eps,
+            "indiff_rel": self.indiff_rel,
             "moments": [
                 None
                 if item is None
@@ -184,8 +237,15 @@ class D16AdamW:
             first = D16ComplexTensor(first_x, first_y, rotation)
             second = D16ComplexTensor.from_real(second_r)
             restored.append(_Moments(entry["step"], first, second))
-        self._set_options(*(state_dict[name] for name in ("lr", "betas", "eps", "weight_decay")))
+        self._set_options(
+            state_dict["lr"],
+            state_dict["betas"],
+            state_dict["eps"],
+            state_dict["weight_decay"],
+            state_dict.get("indiff_eps", 0.0),
+            state_dict.get("indiff_rel", 0.25),
+        )
         self._moments = restored
 
 
-__all__ = ["D16AdamW"]
+__all__ = ["D16AdamW", "IndiffThreshold"]
