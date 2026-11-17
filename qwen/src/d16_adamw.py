@@ -114,7 +114,7 @@ class D16AdamW:
 
     def _should_apply_indiff_threshold(self, parameter: D16Parameter) -> bool:
         """Apply 0xFFFF manifold threshold to 2D+ complex weight matrices (skipping 1D gains and biases)."""
-        if parameter.real_only or parameter.x.ndim < 2:
+        if parameter.x.ndim < 2:
             return False
         if self.indiff_eps == "auto":
             return self.indiff_rel > 0.0
@@ -126,7 +126,7 @@ class D16AdamW:
         if max_grad_norm is not None and not 0 <= max_grad_norm < math.inf:
             raise ValueError("max_grad_norm must be nonnegative and finite")
         first_parameter = self.parameters[0].x
-        grads = [(p.x.grad, None if p.real_only else p.y.grad) for p in self.parameters]
+        grads = [(p.x.grad, p.y.grad) for p in self.parameters]
         norms = [
             torch.linalg.vector_norm(g, dtype=_accumulation_dtype(g)).to(first_parameter.device)
             for pair in grads for g in pair if g is not None

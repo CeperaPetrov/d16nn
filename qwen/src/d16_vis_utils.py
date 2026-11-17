@@ -213,9 +213,7 @@ def _iter_complex_d16_parameters(
             continue
         if id(mod) in seen:
             continue
-        if mod.real_only:
-            continue
-        if not include_biases and name.endswith("bias"):
+        if not include_biases and (mod.x.ndim < 2 or name.endswith("bias")):
             continue
         if module_name is not None and module_name not in name:
             continue

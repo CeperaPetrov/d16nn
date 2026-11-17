@@ -1184,6 +1184,21 @@ if _HAS_TORCH:
             return cls(x, torch.zeros_like(x), mask)
 
         @classmethod
+        def ones(
+            cls,
+            shape: Union[int, Sequence[int], torch.Size],
+            *,
+            dtype: torch.dtype = torch.float32,
+            device: Optional[Union[str, torch.device]] = None,
+        ) -> "D16ComplexTensor":
+            """Create a D16ComplexTensor of multiplicative identities (x=1, y=0, rotation=REAL_POSITIVE)."""
+            if isinstance(shape, int):
+                shape = (shape,)
+            x = torch.ones(shape, dtype=dtype, device=device)
+            mask = torch.full(shape, REAL_POSITIVE, dtype=torch.int32, device=x.device)
+            return cls(x, torch.zeros_like(x), mask)
+
+        @classmethod
         def zeros_like(
             cls,
             other: Union["D16ComplexTensor", torch.Tensor],
@@ -1303,6 +1318,15 @@ if _HAS_TORCH:
 
         def norm_squared(self) -> torch.Tensor:
             return self.x * self.x + self.y * self.y
+
+        def rms_normalize(self, eps: float = 1e-6) -> "D16ComplexTensor":
+            """Normalize wedge radius across the last dimension (preserving sector masks and NaN propagation)."""
+            calc_dtype = torch.float64 if self.dtype == torch.float64 else torch.float32
+            hs = self.to(calc_dtype)
+            mean_square = hs.norm_squared().mean(dim=-1, keepdim=True)
+            undefined = self.is_nan().any(dim=-1, keepdim=True)
+            inv_rms = (mean_square + eps).rsqrt().masked_fill(undefined, float("nan"))
+            return _scale_wedge(hs, inv_rms).to(self.dtype)
 
         def norm_squared_d16(self) -> "D16ComplexTensor":
             ns = self.norm_squared().masked_fill(self.is_nan(), float("nan"))

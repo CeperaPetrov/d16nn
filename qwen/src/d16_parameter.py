@@ -12,16 +12,20 @@ from d16_complex import D16ComplexTensor
 class D16Parameter(nn.Module):
     """Register the coordinates and mask of a canonical D16 value."""
 
-    def __init__(self, value: D16ComplexTensor, *, real_only: bool = False) -> None:
+    def __init__(self, value: D16ComplexTensor) -> None:
         super().__init__()
         self.x = nn.Parameter(value.x.detach())
         self.y = nn.Parameter(value.y.detach())
         self.register_buffer("rotation", value.rotation.detach().to(torch.int32))
-        self.real_only = real_only
 
     @classmethod
-    def zeros(cls, shape: tuple[int, ...], *, real_only: bool = False) -> "D16Parameter":
-        return cls(D16ComplexTensor.zeros(shape), real_only=real_only)
+    def zeros(cls, shape: tuple[int, ...]) -> "D16Parameter":
+        return cls(D16ComplexTensor.zeros(shape))
+
+    @classmethod
+    def ones(cls, shape: tuple[int, ...]) -> "D16Parameter":
+        """Initialize a D16Parameter at the multiplicative identity (x=1, y=0, rotation=0x8001)."""
+        return cls(D16ComplexTensor.ones(shape))
 
     @classmethod
     @torch.no_grad()
@@ -49,7 +53,7 @@ class D16Parameter(nn.Module):
 
     def has_grad(self) -> bool:
         """Return True if either coordinate has accumulated a gradient."""
-        return (self.x.grad is not None) or (not self.real_only and self.y.grad is not None)
+        return (self.x.grad is not None) or (self.y.grad is not None)
 
     @torch.no_grad()
     def grad_d16(self, index=..., *, dtype: Optional[torch.dtype] = None) -> D16ComplexTensor:
@@ -64,7 +68,7 @@ class D16Parameter(nn.Module):
         )
         gy = (
             torch.zeros_like(weight.y)
-            if (self.real_only or self.y.grad is None)
+            if self.y.grad is None
             else self.y.grad[index].to(dtype=target_dtype)
         )
         return D16ComplexTensor.from_local_tangent(gx, gy, weight)
