@@ -36,7 +36,7 @@ class D16AdamW:
     """AdamW operating purely through D16ComplexTensor arithmetic (+, -, *).
 
     First moments are complex D16ComplexTensor objects accumulated via D16 addition.
-    Second moments are real-axis D16ComplexTensor objects accumulated via real_add.
+    Second moments are nonnegative D16ComplexTensor objects accumulated via D16 addition.
     Weight updates and decay are executed via D16 multiplication and subtraction,
     automatically updating sector masks inside D16ComplexTensor.
 
@@ -171,10 +171,8 @@ class D16AdamW:
 
             # Pure D16ComplexTensor arithmetic:
             first = prev_first * beta1 + gradient * (1.0 - beta1)
-            second = (prev_second * beta2).real_add(gradient.norm_squared_d16() * (1.0 - beta2))
-
-            second_radius = second.real_signed()
-            denom = (second_radius / correction2).sqrt() + self.eps
+            second = prev_second * beta2 + gradient.norm_squared_d16() * (1.0 - beta2)
+            denom = (second.x / correction2).sqrt() + self.eps
             delta = first * (step_size / denom)
             updated = weight * decay - delta
 

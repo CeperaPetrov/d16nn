@@ -947,7 +947,7 @@ if _HAS_TORCH:
         def forward(ctx, real: torch.Tensor, imag: torch.Tensor):
             x, y, rotation = d16_from_xy_u16(real, imag)
             ctx.save_for_backward(rotation)
-            ctx. re_shape = real.shape
+            ctx.re_shape = real.shape
             ctx.im_shape = imag.shape
             ctx.mark_non_differentiable(rotation)
             return x, y, rotation
@@ -1055,70 +1055,6 @@ if _HAS_TORCH:
         negative = value < 0
         magnitude = torch.where(negative, -value, value)
         return _real_magnitude(magnitude, negative, ~torch.isfinite(value))
-
-    def _real_add(a: "D16ComplexTensor", b: "D16ComplexTensor") -> "D16ComplexTensor":
-        a_negative = a.rotation == REAL_NEGATIVE
-        b_negative = b.rotation == REAL_NEGATIVE
-        same_ray = a_negative == b_negative
-        difference = a.x - b.x
-        flip = difference < 0
-        magnitude = torch.where(same_ray, a.x + b.x, torch.where(flip, -difference, difference))
-        negative = a_negative ^ (~same_ray & flip)
-        return _real_magnitude(magnitude, negative, a.is_nan() | b.is_nan())
-
-    def _real_negate(value: "D16ComplexTensor") -> "D16ComplexTensor":
-        return _real_magnitude(value.x, value.rotation != REAL_NEGATIVE, value.is_nan())
-
-    def _real_multiply(a: "D16ComplexTensor", b: "D16ComplexTensor") -> "D16ComplexTensor":
-        negative = (a.rotation == REAL_NEGATIVE) ^ (b.rotation == REAL_NEGATIVE)
-        return _real_magnitude(a.x * b.x, negative, a.is_nan() | b.is_nan())
-
-    def _real_matmul(a: "D16ComplexTensor", b: "D16ComplexTensor") -> "D16ComplexTensor":
-        dtype = torch.promote_types(a.dtype, b.dtype)
-        accum_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
-
-        a_vector = a.x.ndim == 1
-        b_vector = b.x.ndim == 1
-        ax = a.x.unsqueeze(0) if a_vector else a.x
-        am = a.rotation.unsqueeze(0) if a_vector else a.rotation
-        bx = b.x.unsqueeze(1) if b_vector else b.x
-        bm = b.rotation.unsqueeze(1) if b_vector else b.rotation
-
-        a_negative = am == REAL_NEGATIVE
-        b_negative = bm == REAL_NEGATIVE
-        ax, bx = ax.to(accum_dtype), bx.to(accum_dtype)
-        a_pos = torch.where(a_negative, 0.0, ax)
-        a_neg = torch.where(a_negative, ax, 0.0)
-        b_pos = torch.where(b_negative, 0.0, bx)
-        b_neg = torch.where(b_negative, bx, 0.0)
-
-        with torch.autocast(device_type=a.device.type, enabled=False):
-            positive = a_pos @ b_pos + a_neg @ b_neg
-            negative = a_pos @ b_neg + a_neg @ b_pos
-            difference = positive - negative
-
-        undefined = (am == MASK_NAN).any(dim=-1, keepdim=True) | (bm == MASK_NAN).any(dim=-2, keepdim=True)
-        if a_vector:
-            difference = difference.squeeze(-2)
-            undefined = undefined.squeeze(-2)
-        if b_vector:
-            difference = difference.squeeze(-1)
-            undefined = undefined.squeeze(-1)
-
-        on_negative_ray = difference < 0
-        magnitude = torch.where(on_negative_ray, -difference, difference).to(dtype)
-        return _real_magnitude(magnitude, on_negative_ray, undefined)
-
-    def _shifted_exp(value: "D16ComplexTensor", active: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        negative = value.rotation == REAL_NEGATIVE
-        dtype = value.dtype
-        x = value.x.float() if dtype in (torch.float16, torch.bfloat16) else value.x
-        positive_max = torch.where(active & ~negative, x, -float("inf")).amax(dim=-1, keepdim=True)
-        negative_max = -torch.where(active & negative, x, float("inf")).amin(dim=-1, keepdim=True)
-        maximum = torch.maximum(positive_max, negative_max)
-        maximum = torch.where(torch.isfinite(maximum), maximum, 0.0)
-        centered = torch.where(negative, -x - maximum, x - maximum)
-        return maximum, torch.where(active, centered, -float("inf")).exp()
 
     def _scale_wedge(z: "D16ComplexTensor", scale: Union[float, int, torch.Tensor]) -> "D16ComplexTensor":
         """Scale a D16ComplexTensor by a real scalar or tensor (handling negative scales via 180° shift)."""
@@ -1230,10 +1166,6 @@ if _HAS_TORCH:
             return cls(*_PackComplex.apply(real, imag))
 
         @classmethod
-        def encode_coordinates(cls, real: torch.Tensor, imag: torch.Tensor) -> "D16ComplexTensor":
-            return cls.pack(real, imag)
-
-        @classmethod
         def from_xy(
             cls,
             logic: torch.Tensor,
@@ -1320,11 +1252,6 @@ if _HAS_TORCH:
 
         def unpack(self) -> Tuple[torch.Tensor, torch.Tensor]:
             return _from_chart(self.x, self.y, self.rotation)
-
-        def real_signed(self) -> torch.Tensor:
-            """Extract signed scalar tensor for a real-axis D16ComplexTensor."""
-            val = torch.where(self.rotation == REAL_NEGATIVE, -self.x, self.x)
-            return val.masked_fill(self.is_nan(), float("nan"))
 
         def to(self, *args, **kwargs) -> "D16ComplexTensor":
             nx = self.x.to(*args, **kwargs)
@@ -1505,68 +1432,6 @@ if _HAS_TORCH:
 
         def __neg__(self) -> "D16ComplexTensor":
             return self.negate()
-
-        # --- Real-Axis Subalgebra Operations (Scores, Softmax, Loss, Linear Contractions) ---
-
-        def real_add(self, other: "D16ComplexTensor") -> "D16ComplexTensor":
-            return _real_add(self, other)
-
-        def real_sub(self, other: "D16ComplexTensor") -> "D16ComplexTensor":
-            return _real_add(self, _real_negate(other))
-
-        def real_negate(self) -> "D16ComplexTensor":
-            return _real_negate(self)
-
-        def real_multiply(self, other: "D16ComplexTensor") -> "D16ComplexTensor":
-            return _real_multiply(self, other)
-
-        def real_matmul(self, other: "D16ComplexTensor") -> "D16ComplexTensor":
-            return _real_matmul(self, other)
-
-        def real_sigmoid(self) -> "D16ComplexTensor":
-            negative = self.rotation == REAL_NEGATIVE
-            exp = (-self.x).exp()
-            one = torch.ones_like(exp)
-            probability = torch.where(negative, exp, one) / (one + exp)
-            return _real_magnitude(probability, torch.zeros_like(negative), self.is_nan())
-
-        def real_softmax(self, allowed: Optional[torch.Tensor] = None) -> "D16ComplexTensor":
-            if self.shape[-1] == 0:
-                return self
-            undefined = self.is_nan()
-            active = ~undefined if allowed is None else allowed & ~undefined
-            if allowed is not None:
-                undefined = undefined & allowed
-            _, terms = _shifted_exp(self, active)
-            probabilities = (terms / terms.sum(dim=-1, keepdim=True).clamp_min(1)).to(self.dtype)
-            return _real_magnitude(probabilities, torch.zeros_like(undefined), undefined.any(dim=-1, keepdim=True))
-
-        def real_argmax(self) -> torch.Tensor:
-            negative = self.rotation == REAL_NEGATIVE
-            nonnegative = ~negative & ~self.is_nan()
-            positive_max, positive_address = self.x.masked_fill(~nonnegative, -torch.inf).max(-1, keepdim=True)
-            negative_min, negative_address = self.x.masked_fill(~negative, torch.inf).min(-1, keepdim=True)
-            first = torch.where(positive_max.isfinite(), positive_address, negative_address)
-            if bool((~positive_max.isfinite() & ~negative_min.isfinite()).any()):
-                raise ValueError("Cannot select a token from undefined logits")
-            return first
-
-        def real_cross_entropy(self, targets: torch.Tensor) -> "D16ComplexTensor":
-            scores = self.to(torch.float32) if self.dtype in (torch.float16, torch.bfloat16) else self
-            valid = targets != -100
-            addresses = targets.masked_fill(~valid, 0).unsqueeze(-1)
-            selected = scores.map_tensors(lambda t: t.gather(-1, addresses).squeeze(-1))
-            undefined = scores.is_nan()
-            maximum, terms = _shifted_exp(scores, ~undefined)
-            distance = _from_real(maximum.squeeze(-1)).real_sub(selected)
-            losses = distance.real_add(_from_real(terms.sum(dim=-1).log()))
-            negative = losses.rotation == REAL_NEGATIVE
-            total = (
-                losses.x.masked_fill(~valid | negative, 0).sum()
-                - losses.x.masked_fill(~valid | ~negative, 0).sum()
-            )
-            mean = (total / valid.sum()).masked_fill((undefined.any(dim=-1) & valid).any(), float("nan"))
-            return _from_real(mean)
 
         # --- Rotation-Free Wedge Signal & Softmax Operations (Using only x, y in [0°, 22.5°]) ---
 

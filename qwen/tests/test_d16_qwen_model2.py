@@ -65,8 +65,8 @@ class TestD16EncapsulationAndAutograd(unittest.TestCase):
         br = torch.randn(16, dtype=torch.float64, requires_grad=True)
         bi = torch.randn(16, dtype=torch.float64, requires_grad=True)
 
-        za = D16ComplexTensor.encode_coordinates(ar, ai)
-        zb = D16ComplexTensor.encode_coordinates(br, bi)
+        za = D16ComplexTensor.pack(ar, ai)
+        zb = D16ComplexTensor.pack(br, bi)
         zc = (za * zb) + (za - zb)
         out_r, out_i = zc.unpack()
         self.assertIsInstance(out_r, torch.Tensor)
@@ -180,7 +180,7 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
         torch.manual_seed(17)
         re = torch.randn(2, 5, 16, dtype=torch.float64) * 4.0
         im = torch.randn(2, 5, 16, dtype=torch.float64) * 4.0
-        z = D16ComplexTensor.encode_coordinates(re, im)
+        z = D16ComplexTensor.pack(re, im)
 
         normed = z.rms_normalize(eps=1e-12)
         mean_sq = normed.norm_squared().mean(dim=-1)
@@ -191,7 +191,7 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
         torch.manual_seed(31)
         re = torch.randn(3, 8, dtype=torch.float64)
         im = torch.randn(3, 8, dtype=torch.float64)
-        z = D16ComplexTensor.encode_coordinates(re, im)
+        z = D16ComplexTensor.pack(re, im)
 
         # 1. Verify standalone .sigmoid() compresses radius into r / (1 + r) in [0, 1) and preserves rotation,
         #    while .activate("sigmoid") executes z * z.sigmoid()
@@ -231,7 +231,7 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
         torch.manual_seed(23)
         re = torch.randn(4, 12, dtype=torch.float64)
         im = torch.randn(4, 12, dtype=torch.float64)
-        z = D16ComplexTensor.encode_coordinates(re, im)
+        z = D16ComplexTensor.pack(re, im)
 
         # Rotating masks across all 16 dihedral operations must not change wedge_softmax or wedge_argmax!
         p_base = z.wedge_softmax(eps="auto", rel=0.30)
