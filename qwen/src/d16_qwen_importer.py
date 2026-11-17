@@ -200,12 +200,12 @@ def load_qwen_checkpoint(
 
         if st_single.is_file():
             from safetensors.torch import load_file
-            return load_file(str(st_single), device=str(device)), cfg_dict
+            return load_file(str(st_single), device=(f"cuda:{torch.cuda.current_device()}" if str(device) == "cuda" else str(device))), cfg_dict
         if st_shards:
             from safetensors.torch import load_file
             merged: Dict[str, torch.Tensor] = {}
             for shard in st_shards:
-                merged.update(load_file(str(shard), device=str(device)))
+                merged.update(load_file(str(shard), device=(f"cuda:{torch.cuda.current_device()}" if str(device) == "cuda" else str(device))))
             return merged, cfg_dict
         if bin_single.is_file():
             return torch.load(str(bin_single), map_location=device, weights_only=True), cfg_dict
@@ -218,7 +218,7 @@ def load_qwen_checkpoint(
             f0 = pt_files[0]
             if f0.suffix == ".safetensors":
                 from safetensors.torch import load_file
-                return load_file(str(f0), device=str(device)), cfg_dict
+                return load_file(str(f0), device=(f"cuda:{torch.cuda.current_device()}" if str(device) == "cuda" else str(device))), cfg_dict
             return torch.load(str(f0), map_location=device, weights_only=True), cfg_dict
         raise FileNotFoundError(f"No .safetensors or .bin checkpoint files found in directory: {path}")
 
@@ -229,7 +229,7 @@ def load_qwen_checkpoint(
             cfg_dict = json.loads(cfg_file.read_text(encoding="utf-8"))
         if path.suffix == ".safetensors":
             from safetensors.torch import load_file
-            return load_file(str(path), device=str(device)), cfg_dict
+            return load_file(str(path), device=(f"cuda:{torch.cuda.current_device()}" if str(device) == "cuda" else str(device))), cfg_dict
         raw = torch.load(str(path), map_location=device, weights_only=True)
         if isinstance(raw, Mapping) and "state_dict" in raw and isinstance(raw["state_dict"], Mapping):
             return raw["state_dict"], cfg_dict
@@ -603,6 +603,7 @@ def import_qwen_weights(
 
     with _fast_empty_d16_init(dtype=target_dtype, device=target_device):
         d16_model = D16QwenForCausalLM(config)
+    d16_model = d16_model.to(device=target_device)
 
     report = ConversionReport(min_orbit_score=min_orbit_score)
 
@@ -914,7 +915,8 @@ def load_d16_checkpoint(
         pt_file = target / "d16_model.pt"
         if st_file.is_file():
             from safetensors.torch import load_file
-            state_dict = load_file(str(st_file), device=str(target_device))
+            st_dev = f"cuda:{torch.cuda.current_device()}" if target_device.type == "cuda" and target_device.index is None else str(target_device)
+            state_dict = load_file(str(st_file), device=st_dev)
         elif pt_file.is_file():
             state_dict = torch.load(str(pt_file), map_location=target_device, weights_only=True)
         else:
@@ -939,6 +941,7 @@ def load_d16_checkpoint(
 
     with _fast_empty_d16_init(dtype=target_dtype, device=target_device):
         d16_model = D16QwenForCausalLM(config)
+    d16_model = d16_model.to(device=target_device)
 
     # Cast floating-point coordinates (x, y) if an explicit dtype override was requested
     if dtype is not None:
@@ -954,6 +957,7 @@ def load_d16_checkpoint(
 
     if config.tie_word_embeddings:
         d16_model.lm_head.weight = d16_model.model.embed_tokens.weight
+    d16_model = d16_model.to(device=target_device)
 
     if return_report:
         return d16_model, report
