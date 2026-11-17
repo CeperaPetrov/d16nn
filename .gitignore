@@ -1,2 +1,5 @@
 /*/__pycache__/
 *.py[cod]
+qwen/ipynb/d16_qwen_checkpoint/d16_orbit_report.pt
+qwen/ipynb/d16_qwen_checkpoint/d16_config.json
+qwen/ipynb/d16_qwen_checkpoint/d16_model.safetensors

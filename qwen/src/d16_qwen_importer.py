@@ -1,8 +1,28 @@
-"""Standalone 1-to-1 Weight Importer from Reference Qwen Checkpoints into d16_qwen_model2."""
+"""Standalone 1-to-1 Weight Importer and Fast D16 Checkpoint Save/Load for d16_qwen_model2.
+
+This module keeps `d16_qwen_model2.py` completely untouched and defines:
+1. `D16QwenImportConfig(D16QwenConfig)`: overrides `complex_hidden_size` so every
+   D16Parameter matrix in `D16QwenForCausalLM` has the exact 1-to-1 shape of the
+   reference Qwen model (`hidden_size`, `intermediate_size`, `vocab_size`).
+2. `find_mlp_quartets`: fast Gram-matrix detector of Z_8 |>< Z_2 orbit quartets
+   (n0, n1, n2, n3) above `min_orbit_score`. Neurons that do not form a quartet
+   above the threshold remain unpaired.
+3. `pack_weights_1to1`: converts any reference weight tensor `W` 1-to-1 into a
+   `D16ComplexTensor` at the exact same coordinates `(layer, neuron, synapse)`
+   using the standard `D16ComplexTensor.pack(re, im)` constructor:
+   - Unpaired weights and `Re`-role quartet weights -> `pack(w, 0.0)`
+   - `Im`-role quartet weights                      -> `pack(0.0, w)`
+4. `import_qwen_weights`: builds a `D16QwenForCausalLM` instance and imports a
+   reference Qwen model (or state_dict / file / directory) 1-to-1.
+5. `save_d16_checkpoint` / `load_d16_checkpoint`: fast serialization and instant
+   restoration of packed `D16QwenForCausalLM` models (supporting both directory
+   checkpoints with `.safetensors` / `d16_config.json` and single `.pt` files)
+   without re-running quartet detection or polar random initialization.
+"""
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
@@ -504,7 +524,7 @@ def pack_weights_1to1(
 
 @contextmanager
 def _fast_empty_d16_init(dtype: torch.dtype, device: Union[str, torch.device]):
-    """Skip expensive random polar sampling when constructing a D16 model for weight import."""
+    """Skip expensive random polar sampling when constructing a D16 model for weight import or checkpoint load."""
     orig_random = D16Parameter.random_matrix
     orig_zeros = D16Parameter.zeros
     orig_ones = D16Parameter.ones
@@ -727,6 +747,219 @@ def print_import_summary(report: ConversionReport) -> None:
     print("=" * 116)
 
 
+# =====================================================================
+# 6. FAST SAVE & LOAD OF PACKED D16 CHECKPOINTS (.safetensors / .pt)
+# =====================================================================
+
+def _serialize_config(model: D16QwenForCausalLM) -> Dict[str, Any]:
+    cfg = model.config
+    cfg_dict = asdict(cfg)
+    cfg_dict["is_1to1_import"] = bool(cfg.complex_hidden_size == cfg.hidden_size)
+    cfg_dict["dtype"] = str(model.model.embed_tokens.weight.x.dtype).replace("torch.", "")
+    return cfg_dict
+
+
+def _deserialize_config(cfg_dict: Mapping[str, Any]) -> Union[D16QwenImportConfig, D16QwenConfig]:
+    is_1to1 = bool(cfg_dict.get("is_1to1_import", True))
+    target_cls = D16QwenImportConfig if is_1to1 else D16QwenConfig
+    valid_keys = {f.name for f in fields(target_cls)}
+    filtered = {k: v for k, v in cfg_dict.items() if k in valid_keys}
+    return target_cls(**filtered)
+
+
+def _deduplicate_tied_state_dict(model: D16QwenForCausalLM) -> Dict[str, torch.Tensor]:
+    """Return a contiguous CPU state_dict omitting duplicate tied `lm_head.weight.*` tensors."""
+    raw_sd = model.state_dict()
+    clean_sd: Dict[str, torch.Tensor] = {}
+    tied = bool(getattr(model.config, "tie_word_embeddings", False))
+    for k, v in raw_sd.items():
+        if tied and k.startswith("lm_head.weight."):
+            continue
+        clean_sd[k] = v.detach().cpu().contiguous()
+    return clean_sd
+
+
+def _serialize_report(report: ConversionReport) -> Dict[str, Any]:
+    return {
+        "min_orbit_score": report.min_orbit_score,
+        "total_imported_tensors": report.total_imported_tensors,
+        "total_weights": report.total_weights,
+        "total_re_weights": report.total_re_weights,
+        "total_im_weights": report.total_im_weights,
+        "layer_reports": {
+            idx: {
+                "layer_idx": lr.layer_idx,
+                "mode": lr.mode,
+                "orig_intermediate_size": lr.orig_intermediate_size,
+                "d16_intermediate_size": lr.d16_intermediate_size,
+                "quadruplets": lr.quadruplets.cpu(),
+                "group_ops": lr.group_ops.cpu(),
+                "orbit_scores": lr.orbit_scores.cpu(),
+                "active_quartet_mask": lr.active_quartet_mask.cpu(),
+                "is_im_neuron": lr.is_im_neuron.cpu(),
+                "paired_neuron_mask": lr.paired_neuron_mask.cpu(),
+                "op_histogram": lr.op_histogram.cpu(),
+                "local_2x2": lr.local_2x2.cpu(),
+            }
+            for idx, lr in report.layer_reports.items()
+        },
+    }
+
+
+def _deserialize_report(data: Mapping[str, Any]) -> ConversionReport:
+    rep = ConversionReport(
+        min_orbit_score=float(data["min_orbit_score"]),
+        total_imported_tensors=int(data.get("total_imported_tensors", 0)),
+        total_weights=int(data.get("total_weights", 0)),
+        total_re_weights=int(data.get("total_re_weights", 0)),
+        total_im_weights=int(data.get("total_im_weights", 0)),
+    )
+    for idx_k, lr_d in data.get("layer_reports", {}).items():
+        rep.layer_reports[int(idx_k)] = LayerOrbitReport(
+            layer_idx=int(lr_d["layer_idx"]),
+            mode=str(lr_d["mode"]),
+            orig_intermediate_size=int(lr_d["orig_intermediate_size"]),
+            d16_intermediate_size=int(lr_d["d16_intermediate_size"]),
+            quadruplets=lr_d["quadruplets"],
+            group_ops=lr_d["group_ops"],
+            orbit_scores=lr_d["orbit_scores"],
+            active_quartet_mask=lr_d["active_quartet_mask"],
+            is_im_neuron=lr_d["is_im_neuron"],
+            paired_neuron_mask=lr_d["paired_neuron_mask"],
+            op_histogram=lr_d["op_histogram"],
+            local_2x2=lr_d["local_2x2"],
+        )
+    return rep
+
+
+@torch.no_grad()
+def save_d16_checkpoint(
+    model: D16QwenForCausalLM,
+    save_path: Union[str, Path],
+    *,
+    report: Optional[ConversionReport] = None,
+    use_safetensors: bool = True,
+) -> Path:
+    """Save a packed/fine-tuned `D16QwenForCausalLM` model (and optional ConversionReport) to disk.
+
+    If `save_path` has a `.pt` or `.pth` suffix, saves a single self-contained PyTorch archive.
+    Otherwise, treats `save_path` as a directory and writes:
+      - `d16_config.json`
+      - `d16_model.safetensors` (or `d16_model.pt` if `safetensors` is unavailable)
+      - `d16_orbit_report.pt` (if `report` is provided)
+    """
+    target = Path(save_path).expanduser()
+    cfg_dict = _serialize_config(model)
+    state_dict = _deduplicate_tied_state_dict(model)
+
+    if target.suffix in (".pt", ".pth", ".bin"):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload: Dict[str, Any] = {
+            "d16_config": cfg_dict,
+            "state_dict": state_dict,
+        }
+        if report is not None:
+            payload["d16_orbit_report"] = _serialize_report(report)
+        torch.save(payload, str(target))
+        return target
+
+    target.mkdir(parents=True, exist_ok=True)
+    cfg_file = target / "d16_config.json"
+    cfg_file.write_text(json.dumps(cfg_dict, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    saved_weights = False
+    if use_safetensors:
+        try:
+            from safetensors.torch import save_file
+            save_file(state_dict, str(target / "d16_model.safetensors"))
+            saved_weights = True
+        except ImportError:
+            saved_weights = False
+
+    if not saved_weights:
+        torch.save(state_dict, str(target / "d16_model.pt"))
+
+    if report is not None:
+        torch.save(_serialize_report(report), str(target / "d16_orbit_report.pt"))
+
+    return target
+
+
+@torch.no_grad()
+def load_d16_checkpoint(
+    load_path: Union[str, Path],
+    *,
+    device: Union[str, torch.device] = "cpu",
+    dtype: Optional[torch.dtype] = None,
+    return_report: bool = False,
+) -> Union[D16QwenForCausalLM, Tuple[D16QwenForCausalLM, Optional[ConversionReport]]]:
+    """Instantly load a packed `D16QwenForCausalLM` checkpoint without quartet search or random init."""
+    target = Path(load_path).expanduser()
+    target_device = torch.device(device)
+    report: Optional[ConversionReport] = None
+
+    if target.is_file() and target.suffix in (".pt", ".pth", ".bin"):
+        raw = torch.load(str(target), map_location=target_device, weights_only=False)
+        cfg_dict = raw["d16_config"]
+        state_dict = raw["state_dict"]
+        if "d16_orbit_report" in raw and raw["d16_orbit_report"] is not None:
+            report = _deserialize_report(raw["d16_orbit_report"])
+    elif target.is_dir():
+        cfg_file = target / "d16_config.json"
+        if not cfg_file.is_file():
+            raise FileNotFoundError(f"Missing 'd16_config.json' in checkpoint directory: {target}")
+        cfg_dict = json.loads(cfg_file.read_text(encoding="utf-8"))
+
+        st_file = target / "d16_model.safetensors"
+        pt_file = target / "d16_model.pt"
+        if st_file.is_file():
+            from safetensors.torch import load_file
+            state_dict = load_file(str(st_file), device=str(target_device))
+        elif pt_file.is_file():
+            state_dict = torch.load(str(pt_file), map_location=target_device, weights_only=True)
+        else:
+            raise FileNotFoundError(f"No 'd16_model.safetensors' or 'd16_model.pt' found in: {target}")
+
+        rep_file = target / "d16_orbit_report.pt"
+        if rep_file.is_file():
+            rep_data = torch.load(str(rep_file), map_location="cpu", weights_only=False)
+            report = _deserialize_report(rep_data)
+    else:
+        raise FileNotFoundError(f"D16 checkpoint path not found: {target}")
+
+    config = _deserialize_config(cfg_dict)
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "float64": torch.float64,
+    }
+    saved_dtype = dtype_map.get(str(cfg_dict.get("dtype", "float32")), torch.float32)
+    target_dtype = saved_dtype if dtype is None else dtype
+
+    with _fast_empty_d16_init(dtype=target_dtype, device=target_device):
+        d16_model = D16QwenForCausalLM(config)
+
+    # Cast floating-point coordinates (x, y) if an explicit dtype override was requested
+    if dtype is not None:
+        for k, v in list(state_dict.items()):
+            if v.is_floating_point() and not k.endswith("inv_freq"):
+                state_dict[k] = v.to(dtype=target_dtype)
+
+    missing, unexpected = d16_model.load_state_dict(state_dict, strict=False)
+    allowed_missing = {"lm_head.weight.x", "lm_head.weight.y", "lm_head.weight.rotation"} if config.tie_word_embeddings else set()
+    real_missing = [k for k in missing if k not in allowed_missing]
+    if real_missing or unexpected:
+        raise RuntimeError(f"D16 checkpoint mismatch! Missing: {real_missing}, Unexpected: {unexpected}")
+
+    if config.tie_word_embeddings:
+        d16_model.lm_head.weight = d16_model.model.embed_tokens.weight
+
+    if return_report:
+        return d16_model, report
+    return d16_model
+
+
 __all__ = [
     "D16QwenImportConfig",
     "LayerOrbitReport",
@@ -736,4 +969,6 @@ __all__ = [
     "pack_weights_1to1",
     "import_qwen_weights",
     "print_import_summary",
+    "save_d16_checkpoint",
+    "load_d16_checkpoint",
 ]

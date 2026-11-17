@@ -21,7 +21,7 @@ import torch
 from d16_adamw import D16AdamW
 from d16_complex import D16ComplexTensor
 from d16_parameter import D16Parameter
-from d16_qwen_importer import D16QwenImportConfig, import_qwen_weights
+from d16_qwen_importer import D16QwenImportConfig, import_qwen_weights, load_d16_checkpoint, save_d16_checkpoint
 from d16_qwen_model2 import D16QwenConfig, D16QwenForCausalLM, encode_token_ids
 
 
@@ -266,6 +266,18 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
         self.assertLess(float(im_unpacked[~im_mask].abs().max().item()), 1e-6)
         self.assertLess(float(re_unpacked[im_mask].abs().max().item()), 1e-6)
         self.assertLess(float((im_unpacked[im_mask] - up_orig[im_mask]).abs().max().item()), 1e-6)
+
+        # Verify fast save_d16_checkpoint and load_d16_checkpoint round-trip
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt_dir = Path(tmpdir) / "d16_ckpt"
+            save_d16_checkpoint(d16_model, ckpt_dir, report=report)
+            restored_model, restored_rep = load_d16_checkpoint(ckpt_dir, return_report=True)
+            self.assertIsNotNone(restored_rep)
+            r_up = restored_model.model.layers[0].mlp.up_proj.weight.value()
+            self.assertTrue(bool((r_up.x == up_d16.x).all()))
+            self.assertTrue(bool((r_up.y == up_d16.y).all()))
+            self.assertTrue(bool((r_up.rotation == up_d16.rotation).all()))
 
     def test_single_branch_d16_rmsnorm_unit_variance_and_complex_gain(self) -> None:
         torch.manual_seed(17)
