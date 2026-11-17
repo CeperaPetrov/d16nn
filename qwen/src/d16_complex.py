@@ -709,10 +709,21 @@ if _HAS_TORCH:
     def d16_from_xy_u16(
         logic: torch.Tensor,
         emotion: torch.Tensor,
-        eps: Union[float, torch.Tensor] = 0.0,
+        eps: Union[float, torch.Tensor, str] = 0.0,
+        rel: float = 0.25,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Vectorized encoding of (logic, emotion) into (x, y) in [0°, 22.5°] and u16 mask."""
-        is_zero = (logic.abs() + emotion.abs()) <= eps
+        if isinstance(eps, str):
+            if eps != "auto":
+                raise ValueError(f"Unknown eps mode: {eps!r}")
+            if rel <= 0.0:
+                threshold: Union[float, torch.Tensor] = 0.0
+            else:
+                rms = (logic.square() + emotion.square()).mean(dim=-1, keepdim=True).sqrt()
+                threshold = rms * rel
+        else:
+            threshold = eps
+        is_zero = (logic.abs() + emotion.abs()) <= threshold
 
         q0 = (logic > 0.0) & (emotion >= 0.0)
         q1 = (logic <= 0.0) & (emotion > 0.0)
@@ -1197,9 +1208,10 @@ if _HAS_TORCH:
             cls,
             logic: torch.Tensor,
             emotion: torch.Tensor,
-            eps: Union[float, torch.Tensor] = 0.0,
+            eps: Union[float, torch.Tensor, str] = 0.0,
+            rel: float = 0.25,
         ) -> "D16ComplexTensor":
-            x, y, m = d16_from_xy_u16(logic, emotion, eps=eps)
+            x, y, m = d16_from_xy_u16(logic, emotion, eps=eps, rel=rel)
             return cls(x, y, m)
 
         @classmethod
@@ -1214,7 +1226,7 @@ if _HAS_TORCH:
             grad_y: torch.Tensor,
             chart_owner: "D16ComplexTensor",
         ) -> "D16ComplexTensor":
-            """Construct a canonical D16ComplexTensor from a signed local tangent in chart_owner's chart."""
+            """Construct a canonical D16ComplexTensor from a signed local tangent (grad_x, grad_y) in chart_owner's chart."""
             lx, ly, lrot = d16_from_xy_u16(grad_x, grad_y)
             turns, reflected = _chart_parameters(chart_owner.rotation)
             rot = _compose_chart_mask(lrot, turns, reflected)
@@ -1270,10 +1282,7 @@ if _HAS_TORCH:
         def unpack(self) -> Tuple["D16ComplexTensor", "D16ComplexTensor"]:
             re, im = _from_chart(self.x, self.y, self.rotation)
             undefined = self.is_nan()
-            return (
-                _from_real(re.masked_fill(undefined, float("nan"))),
-                _from_real(im.masked_fill(undefined, float("nan"))),
-            )
+            return _from_real(re.masked_fill(undefined, float("nan"))), _from_real(im.masked_fill(undefined, float("nan")))
 
         def real_signed(self) -> torch.Tensor:
             """Extract signed scalar tensor for a real-axis D16ComplexTensor."""
@@ -1344,9 +1353,29 @@ if _HAS_TORCH:
             z_m = torch.where(cond, torch.full_like(self.rotation, MASK_ZERO), self.rotation)
             return D16ComplexTensor(z_x, z_y, z_m)
 
-        def apply_Manifold_Threshold_L1(self, eps: Union[float, torch.Tensor]) -> "D16ComplexTensor":
+        def apply_Manifold_Threshold_L1(
+            self,
+            eps: Union[float, torch.Tensor, str] = 0.0,
+            *,
+            rel: float = 0.25,
+            dim: Optional[Union[int, Tuple[int, ...]]] = -1,
+        ) -> "D16ComplexTensor":
+            if isinstance(eps, str):
+                if eps != "auto":
+                    raise ValueError(f"Unknown manifold threshold mode: {eps!r}")
+                if rel <= 0.0:
+                    return self
+                msq = self.norm_squared()
+                rms = msq.mean(dim=dim, keepdim=True).sqrt() if dim is not None else msq.mean().sqrt()
+                threshold: Union[float, torch.Tensor] = rms * rel
+            elif isinstance(eps, (int, float)):
+                if eps <= 0.0:
+                    return self
+                threshold = float(eps)
+            else:
+                threshold = eps
             re, im = self.unpack()
-            return self.to_indifferent_where((re.x + im.x) <= eps)
+            return self.to_indifferent_where((re.x + im.x) <= threshold)
 
         # --- Dihedral & Algebraic Operations (Autograd-Enabled) ---
 

@@ -112,18 +112,13 @@ class D16AdamW:
         for start in range(0, parameter.x.shape[0], rows):
             yield slice(start, start + rows)
 
-    def _resolve_indiff_threshold(
-        self, updated: D16ComplexTensor, parameter: D16Parameter
-    ) -> float | torch.Tensor:
-        """Compute active 0xFFFF threshold for complex weights (skipping 1D real_only gains and biases)."""
+    def _should_apply_indiff_threshold(self, parameter: D16Parameter) -> bool:
+        """Apply 0xFFFF manifold threshold to 2D+ complex weight matrices (skipping 1D gains and biases)."""
         if parameter.real_only or parameter.x.ndim < 2:
-            return 0.0
+            return False
         if self.indiff_eps == "auto":
-            if self.indiff_rel <= 0.0:
-                return 0.0
-            rms_radius = updated.norm_squared().mean().sqrt()
-            return rms_radius * self.indiff_rel
-        return self.indiff_eps
+            return self.indiff_rel > 0.0
+        return float(self.indiff_eps) > 0.0
 
     @torch.no_grad()
     def step(self, max_grad_norm: float | None = None) -> torch.Tensor:
@@ -183,9 +178,10 @@ class D16AdamW:
             delta = first * (step_size / denom)
             updated = weight * decay - delta
 
-            threshold = self._resolve_indiff_threshold(updated, parameter)
-            if isinstance(threshold, torch.Tensor) or threshold > 0.0:
-                updated = updated.apply_Manifold_Threshold_L1(threshold)
+            if self._should_apply_indiff_threshold(parameter):
+                updated = updated.apply_Manifold_Threshold_L1(
+                    self.indiff_eps, rel=self.indiff_rel, dim=None
+                )
 
             parameter.copy_(updated.round_to_dtype(stored_weight.dtype), index=index)
             moments.first.copy_slice_(index, first)

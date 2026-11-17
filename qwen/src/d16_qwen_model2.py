@@ -31,6 +31,7 @@ from d16_qwen_model import (
 )
 
 WeightStorage = Literal["d16", "cartesian"]
+IndiffThreshold = float | Literal["auto"]
 
 
 def _stores_d16(weight_storage: WeightStorage) -> bool:
@@ -70,6 +71,8 @@ class D16QwenConfig(_QwenConfig):
     """Hidden size counts real coordinates, two per complex channel."""
 
     weight_storage: WeightStorage = "d16"
+    indiff_eps: IndiffThreshold = 0.0
+    indiff_rel: float = 0.25
 
     @property
     def complex_hidden_size(self) -> int:
@@ -126,7 +129,8 @@ class D16Linear(nn.Module):
         weight: D16ComplexTensor,
         bias: Optional[D16ComplexTensor],
         dtype: torch.dtype,
-        eps: float,
+        eps: IndiffThreshold,
+        rel: float,
     ) -> D16ComplexTensor:
         wr, wi = weight.map_tensors(lambda t: t.transpose(0, 1)).to(re.dtype).unpack()
         out_re = re.real_matmul(wr).real_sub(im.real_matmul(wi))
@@ -134,8 +138,8 @@ class D16Linear(nn.Module):
         z = D16ComplexTensor.pack(out_re, out_im)
         if bias is not None:
             z = z + bias.to(re.dtype)
-        if eps > 0:
-            z = z.apply_Manifold_Threshold_L1(eps)
+        if eps == "auto" or (isinstance(eps, (int, float)) and eps > 0):
+            z = z.apply_Manifold_Threshold_L1(eps, rel=rel, dim=-1)
         return z.to(dtype)
 
     def _project_cartesian_tile(
@@ -147,7 +151,8 @@ class D16Linear(nn.Module):
         bias_real: Optional[torch.Tensor],
         bias_imag: Optional[torch.Tensor],
         dtype: torch.dtype,
-        eps: float,
+        eps: IndiffThreshold,
+        rel: float,
     ) -> D16ComplexTensor:
         weight = D16ComplexTensor.encode_coordinates(weight_real.to(re.dtype), weight_imag.to(re.dtype))
         bias = (
@@ -155,9 +160,15 @@ class D16Linear(nn.Module):
             if bias_real is None
             else D16ComplexTensor.encode_coordinates(bias_real.to(re.dtype), bias_imag.to(re.dtype))
         )
-        return self._project_tile(re, im, weight, bias, dtype, eps)
+        return self._project_tile(re, im, weight, bias, dtype, eps, rel)
 
-    def forward(self, hidden_states: D16ComplexTensor, *, eps: float = 0.0) -> D16ComplexTensor:
+    def forward(
+        self,
+        hidden_states: D16ComplexTensor,
+        *,
+        eps: IndiffThreshold = 0.0,
+        rel: float = 0.25,
+    ) -> D16ComplexTensor:
         re, im = hidden_states.unpack()
         weight_dtype = self.weight.x.dtype if self._native_weights else self.weight_real.dtype
         dtype = torch.promote_types(hidden_states.dtype, weight_dtype)
@@ -179,7 +190,7 @@ class D16Linear(nn.Module):
             )
         recompute = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         for parameter_tile in parameter_tiles:
-            args = (re, im, *parameter_tile, dtype, eps)
+            args = (re, im, *parameter_tile, dtype, eps, rel)
             if recompute:
                 z = checkpoint(project, *args, use_reentrant=False, preserve_rng_state=False)
             else:
@@ -335,7 +346,8 @@ class D16QwenMLP(nn.Module):
         self.down_proj = D16Linear(
             config.intermediate_size, config.complex_hidden_size, bias=config.mlp_bias, weight_storage=ws
         )
-        self.indiff_eps = config.indiff_eps
+        self.indiff_eps: IndiffThreshold = config.indiff_eps
+        self.indiff_rel: float = config.indiff_rel
         self.collect_stats = config.collect_d16_stats
         self.steer_mode = "identity"
         self.steer_shift = 0
@@ -350,7 +362,7 @@ class D16QwenMLP(nn.Module):
         self.indifferent_elements = 0
 
     def forward(self, hidden_states: D16ComplexTensor) -> D16ComplexTensor:
-        z = self.up_proj(hidden_states, eps=self.indiff_eps)
+        z = self.up_proj(hidden_states, eps=self.indiff_eps, rel=self.indiff_rel)
         if self.steer_mode != "identity":
             channels = self.steer_channels
             if channels is not None:

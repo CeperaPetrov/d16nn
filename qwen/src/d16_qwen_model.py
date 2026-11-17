@@ -65,7 +65,8 @@ class D16QwenConfig:
     mlp_bias: bool = False
 
     # D16Complex runtime parameters
-    indiff_eps: float = 0.0
+    indiff_eps: Union[float, str] = 0.0
+    indiff_rel: float = 0.25
     collect_d16_stats: bool = False
 
     @property
@@ -81,7 +82,8 @@ class D16QwenConfig:
         num_hidden_layers: int = 2,
         num_attention_heads: int = 4,
         num_key_value_heads: int = 2,
-        indiff_eps: float = 0.0,
+        indiff_eps: Union[float, str] = 0.0,
+        indiff_rel: float = 0.25,
     ) -> "D16QwenConfig":
         """Compact configuration for fast unit tests and training from scratch."""
         return cls(
@@ -98,6 +100,7 @@ class D16QwenConfig:
             attention_bias=True,
             mlp_bias=False,
             indiff_eps=indiff_eps,
+            indiff_rel=indiff_rel,
         )
 
 
@@ -329,6 +332,7 @@ class D16QwenMLP(nn.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.indiff_eps = config.indiff_eps
+        self.indiff_rel = config.indiff_rel
         self.collect_stats = config.collect_d16_stats
 
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
@@ -416,7 +420,7 @@ class D16QwenMLP(nn.Module):
         """Encode input x into the N D16Complex objects of this layer."""
         logic = self.up_proj(x)
         emotion = self.gate_proj(x)
-        z = D16ComplexTensor.from_xy(logic, emotion, eps=self.indiff_eps)
+        z = D16ComplexTensor.from_xy(logic, emotion, eps=self.indiff_eps, rel=self.indiff_rel)
 
         # If bitwise orbit partner links are active, instantiate partner D16Complex objects
         # by taking anchor (x, y) and rotating only the 16-bit mask via Z_8 |>< Z_2!
@@ -676,10 +680,16 @@ class D16QwenForCausalLM(nn.Module):
 
     # --- D16 Telemetry, Indifferent Sparsity & Sector Steering Controls ---
 
-    def set_indifferent_threshold(self, eps: float) -> None:
+    def set_indifferent_threshold(self, eps: Union[float, str], rel: Optional[float] = None) -> None:
+        if eps != "auto" and (not isinstance(eps, (int, float)) or float(eps) < 0.0):
+            raise ValueError("eps must be a nonnegative float or 'auto'")
         self.config.indiff_eps = eps
+        if rel is not None:
+            self.config.indiff_rel = float(rel)
         for layer in self.model.layers:
             layer.mlp.indiff_eps = eps
+            if rel is not None:
+                layer.mlp.indiff_rel = float(rel)
 
     def set_collect_d16_stats(self, enabled: bool = True, reset: bool = True) -> None:
         self.config.collect_d16_stats = enabled

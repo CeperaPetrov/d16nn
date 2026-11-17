@@ -168,6 +168,42 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
         self.assertTrue(bool((gen.x.to(torch.long) == raw_tokens).all()))
 
 
+    def test_activation_auto_indiff_threshold_and_runtime_switch(self) -> None:
+        torch.manual_seed(19)
+        cfg = D16QwenConfig(
+            vocab_size=32,
+            hidden_size=32,
+            intermediate_size=48,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            weight_storage="d16",
+            indiff_eps="auto",
+            indiff_rel=0.25,
+            collect_d16_stats=True,
+        )
+        model = D16QwenForCausalLM(cfg).eval()
+        raw_ids = torch.randint(0, 32, (2, 8), dtype=torch.long)
+        d16_ids = encode_token_ids(raw_ids)
+
+        with torch.no_grad():
+            model.set_collect_d16_stats(True, reset=True)
+            _ = model(d16_ids)
+            sp_25 = model.get_d16_state_summary()["indifferent_pct"]
+            self.assertGreater(sp_25, 0.0)
+
+            model.set_indifferent_threshold("auto", rel=0.40)
+            model.set_collect_d16_stats(True, reset=True)
+            _ = model(d16_ids)
+            sp_40 = model.get_d16_state_summary()["indifferent_pct"]
+            self.assertGreater(sp_40, sp_25)
+
+            model.set_indifferent_threshold(0.0)
+            model.set_collect_d16_stats(True, reset=True)
+            _ = model(d16_ids)
+            sp_0 = model.get_d16_state_summary()["indifferent_pct"]
+            self.assertEqual(sp_0, 0.0)
+
     def test_d16_adamw_manual_and_auto_indiff_eps(self) -> None:
         for mode_eps in (0.04, "auto"):
             torch.manual_seed(42)
@@ -179,7 +215,8 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
                 num_attention_heads=4,
                 num_key_value_heads=2,
                 weight_storage="d16",
-                indiff_eps=0.15,
+                indiff_eps="auto",
+                indiff_rel=0.25,
             )
             model = D16QwenForCausalLM(cfg)
             optimizer = D16AdamW(
