@@ -1264,6 +1264,27 @@ if _HAS_TORCH:
                 nrot = nrot.masked_fill(undefined, MASK_NAN)
             return D16ComplexTensor(nx, ny, nrot)
 
+        def cpu(self, memory_format: torch.memory_format = torch.preserve_format) -> "D16ComplexTensor":
+            """Move D16ComplexTensor coordinates and rotation mask to CPU memory."""
+            return D16ComplexTensor(
+                self.x.cpu(memory_format=memory_format),
+                self.y.cpu(memory_format=memory_format),
+                self.rotation.cpu(memory_format=memory_format),
+            )
+
+        def cuda(
+            self,
+            device: Optional[Union[int, str, torch.device]] = None,
+            non_blocking: bool = False,
+            memory_format: torch.memory_format = torch.preserve_format,
+        ) -> "D16ComplexTensor":
+            """Move D16ComplexTensor coordinates and rotation mask to CUDA memory."""
+            return D16ComplexTensor(
+                self.x.cuda(device=device, non_blocking=non_blocking, memory_format=memory_format),
+                self.y.cuda(device=device, non_blocking=non_blocking, memory_format=memory_format),
+                self.rotation.cuda(device=device, non_blocking=non_blocking, memory_format=memory_format),
+            )
+
         def round_to_dtype(self, dtype: torch.dtype) -> "D16ComplexTensor":
             if self.dtype == dtype:
                 return self

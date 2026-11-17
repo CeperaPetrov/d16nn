@@ -230,7 +230,7 @@ def snapshot_d16_weight_states(
     """Capture a detached CPU snapshot of all complex D16Parameter values before training."""
     snapshot: Dict[str, D16ComplexTensor] = {}
     for name, mod in _iter_complex_d16_parameters(model, include_biases=include_biases):
-        snapshot[name] = mod.value().detach().to("cpu").clone()
+        snapshot[name] = mod.value().detach().cpu().clone()
     return snapshot
 
 
@@ -257,7 +257,7 @@ def print_d16_weight_migration_table(
     total_indiff = 0
 
     for name, mod in params:
-        val = mod.value().detach().to("cpu")
+        val = mod.value().detach().cpu()
         n_el = val.numel()
         radii = val.norm_squared().sqrt()
         mean_r = float(radii.mean().item())
@@ -322,7 +322,7 @@ def plot_d16_weight_sector_distribution(
     xs_list, ys_list, st_list = [], [], []
 
     for name, mod in params:
-        val = mod.value().detach().to("cpu")
+        val = mod.value().detach().cpu()
         st = val.state().flatten()
         after_counts += torch.bincount(st, minlength=18)
         xs_list.append(val.x.flatten())
@@ -469,7 +469,7 @@ def plot_d16_sector_transition_matrix(
         if name not in initial_snapshot:
             continue
         s_init = initial_snapshot[name].state().flatten()
-        s_curr = mod.value().detach().to("cpu").state().flatten()
+        s_curr = mod.value().detach().cpu().state().flatten()
         valid = (s_init < 16) & (s_curr < 16)
         pairs = s_init[valid] * 16 + s_curr[valid]
         trans_mat += torch.bincount(pairs, minlength=256).reshape(16, 16)
@@ -553,7 +553,7 @@ class D16TrajectoryRecorder:
             for name, mod in _iter_complex_d16_parameters(model):
                 if self._classify_module(name) == grp:
                     self._synapse_module_names[grp] = name
-                    val = mod.value().detach().to("cpu")
+                    val = mod.value().detach().cpu()
                     n_el = val.numel()
                     k = min(self.tracked_synapses_per_group, n_el)
                     # Pick evenly spaced indices across the weight matrix
@@ -580,7 +580,7 @@ class D16TrajectoryRecorder:
 
         for name, mod in _iter_complex_d16_parameters(model):
             grp = self._classify_module(name)
-            val = mod.value().detach().to("cpu")
+            val = mod.value().detach().cpu()
             st_curr = val.state()
             st_init = self.initial_snapshot[name].state()
             st_prev = self.prev_snapshot[name].state()

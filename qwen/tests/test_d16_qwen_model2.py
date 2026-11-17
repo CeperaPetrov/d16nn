@@ -99,6 +99,9 @@ class TestD16EncapsulationAndAutograd(unittest.TestCase):
         self.assertLess(float((ai.grad - ai_ref.grad).abs().max().item()), 1e-12)
         self.assertLess(float((br.grad - br_ref.grad).abs().max().item()), 1e-12)
         self.assertLess(float((bi.grad - bi_ref.grad).abs().max().item()), 1e-12)
+        z_cpu = zc.detach().cpu()
+        self.assertEqual(z_cpu.device.type, "cpu")
+        self.assertTrue(hasattr(z_cpu, "cuda"))
 
 
     def test_d16_complex_tensor_matmul_operator(self) -> None:
