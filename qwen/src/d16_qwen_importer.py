@@ -502,23 +502,64 @@ def find_mlp_quartets(
 # =====================================================================
 
 @torch.no_grad()
+def compute_d16_second_coord(
+    w: torch.Tensor,
+    mode: str = "d16_sat_det",
+    *,
+    c_sat: float = 0.205,
+    c_w0: float = 0.120,
+) -> torch.Tensor:
+    """Compute the complementary D16 coordinate w2 = f(w1) via D16 radial saturation."""
+    if mode == "zero":
+        return torch.zeros_like(w)
+
+    wf = w.detach().to(torch.float32)
+    sigma_w = wf.square().mean().sqrt().clamp_min(1e-8)
+    y_sat = c_sat * sigma_w
+    w0 = c_w0 * sigma_w
+    envelope = y_sat * (wf.abs() / (w0 + wf.abs()))
+
+    if mode == "d16_sat_rand":
+        xi = torch.randn_like(wf)
+    elif mode == "d16_sat_det":
+        if wf.shape[-1] >= 3:
+            dw = torch.roll(wf, -1, dims=-1) - torch.roll(wf, 1, dims=-1)
+        else:
+            dw = wf.clone()
+        dw_std = dw.square().mean().sqrt().clamp_min(1e-8)
+        # Шахматная чётность (-1)^(i+j) гарантирует идеальную симметрию S0=S15 и S7=S8
+        idx_last = torch.arange(wf.shape[-1], device=wf.device)
+        if wf.ndim >= 2:
+            idx_prev = torch.arange(wf.shape[-2], device=wf.device).unsqueeze(-1)
+            parity = torch.where(((idx_prev + idx_last) & 1) == 0, 1.0, -1.0)
+        else:
+            parity = torch.where((idx_last & 1) == 0, 1.0, -1.0)
+        xi = (dw / dw_std) * parity
+    else:
+        raise ValueError(f"Unknown second_coord_mode: {mode!r}")
+
+    return (envelope * xi).to(dtype=w.dtype)
+
+
+@torch.no_grad()
 def pack_weights_1to1(
     weight: torch.Tensor,
     is_im_mask: Optional[torch.Tensor] = None,
     *,
     im_dim: int = 0,
+    second_coord_mode: str = "d16_sat_det",
 ) -> D16ComplexTensor:
-    """Convert a real weight tensor 1-to-1 into a `D16ComplexTensor` via `D16ComplexTensor.pack`."""
-    w = weight.detach()
-    zeros = torch.zeros_like(w)
+    """Convert a real weight tensor 1-to-1 into a `D16ComplexTensor` with reconstructed 2nd coordinate."""
+    w1 = weight.detach()
+    w2 = compute_d16_second_coord(w1, mode=second_coord_mode)
     if is_im_mask is None or not bool(is_im_mask.any()):
-        return D16ComplexTensor.pack(w, zeros)
+        return D16ComplexTensor.pack(w1, w2)
 
-    mask = is_im_mask.to(device=w.device, dtype=torch.bool)
-    if w.ndim == 2 and mask.ndim == 1:
+    mask = is_im_mask.to(device=w1.device, dtype=torch.bool)
+    if w1.ndim == 2 and mask.ndim == 1:
         mask = mask.unsqueeze(1) if im_dim == 0 else mask.unsqueeze(0)
-    re = torch.where(mask, zeros, w)
-    im = torch.where(mask, w, zeros)
+    re = torch.where(mask, w2, w1)
+    im = torch.where(mask, w1, w2)
     return D16ComplexTensor.pack(re, im)
 
 
