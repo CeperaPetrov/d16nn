@@ -20,9 +20,12 @@ from torch import nn
 from d16_complex import D16Complex, D16ComplexTensor, STATE_LABELS, TAN_PI_8
 from d16_parameter import D16Parameter
 try:
-    from d16_qwen_converter import ConversionReport, LayerOrbitReport
+    from d16_qwen_importer import ConversionReport, LayerOrbitReport
 except ImportError:  # pragma: no cover
-    ConversionReport = LayerOrbitReport = object  # type: ignore[misc,assignment]
+    try:
+        from d16_qwen_converter import ConversionReport, LayerOrbitReport
+    except ImportError:
+        ConversionReport = LayerOrbitReport = object  # type: ignore[misc,assignment]
 from d16_qwen_model import D16QwenMLP
 
 

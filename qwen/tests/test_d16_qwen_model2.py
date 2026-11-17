@@ -21,6 +21,7 @@ import torch
 from d16_adamw import D16AdamW
 from d16_complex import D16ComplexTensor
 from d16_parameter import D16Parameter
+from d16_qwen_importer import D16QwenImportConfig, import_qwen_weights
 from d16_qwen_model2 import D16QwenConfig, D16QwenForCausalLM, encode_token_ids
 
 
@@ -52,7 +53,7 @@ class TestD16EncapsulationAndAutograd(unittest.TestCase):
             "_AddComplex",
         }
         src_dir = Path(sys.path[0]) if Path(sys.path[0]).is_dir() else _THIS_DIR
-        for fname in ("d16_parameter.py", "d16_adamw.py", "d16_qwen_model2.py"):
+        for fname in ("d16_parameter.py", "d16_adamw.py", "d16_qwen_model2.py", "d16_qwen_importer.py"):
             fpath = src_dir / fname if (src_dir / fname).is_file() else _THIS_DIR / fname
             tree = ast.parse(fpath.read_text(encoding="utf-8"), filename=fname)
             used_names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
@@ -219,6 +220,52 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
         gen = model.generate(d16_tokens[:, :4], max_new_tokens=8, do_sample=False, use_cache=True)
         self.assertTrue(bool((gen.x.to(torch.long) == raw_tokens).all()))
 
+
+    def test_1to1_qwen_importer_quartets_and_unpaired_weights(self) -> None:
+        torch.manual_seed(7)
+        V, H, I, L = 32, 16, 24, 2
+        sd = {
+            "model.embed_tokens.weight": torch.randn(V, H) * 0.02,
+            "model.norm.weight": torch.ones(H),
+        }
+        for l_idx in range(L):
+            p = f"model.layers.{l_idx}"
+            sd[f"{p}.input_layernorm.weight"] = torch.ones(H)
+            sd[f"{p}.post_attention_layernorm.weight"] = torch.ones(H)
+            sd[f"{p}.self_attn.q_proj.weight"] = torch.randn(H, H) * 0.1
+            sd[f"{p}.self_attn.q_proj.bias"] = torch.zeros(H)
+            sd[f"{p}.self_attn.k_proj.weight"] = torch.randn(H // 2, H) * 0.1
+            sd[f"{p}.self_attn.k_proj.bias"] = torch.zeros(H // 2)
+            sd[f"{p}.self_attn.v_proj.weight"] = torch.randn(H // 2, H) * 0.1
+            sd[f"{p}.self_attn.v_proj.bias"] = torch.zeros(H // 2)
+            sd[f"{p}.self_attn.o_proj.weight"] = torch.randn(H, H) * 0.1
+
+            up = torch.randn(I, H) * 0.1
+            gate = torch.randn(I, H) * 0.1
+            for q in range(3):
+                base = q * 4
+                u0, g0 = up[base].clone(), gate[base].clone()
+                up[base + 1], gate[base + 1] = -g0, u0
+                up[base + 2], gate[base + 2] = (u0 - g0) * 0.70710678, (u0 + g0) * 0.70710678
+                up[base + 3], gate[base + 3] = u0, -g0
+            sd[f"{p}.mlp.up_proj.weight"] = up
+            sd[f"{p}.mlp.gate_proj.weight"] = gate
+            sd[f"{p}.mlp.down_proj.weight"] = torch.randn(H, I) * 0.1
+
+        cfg = D16QwenImportConfig.from_state_dict(sd, num_attention_heads=4, indiff_eps="auto", indiff_rel=0.30)
+        d16_model, report = import_qwen_weights(sd, config=cfg, min_orbit_score=0.60)
+
+        # Verify 1-to-1 coordinates and Re (in x) vs Im (in y) placement
+        up_orig = sd["model.layers.0.mlp.up_proj.weight"]
+        up_d16 = d16_model.model.layers[0].mlp.up_proj.weight.value()
+        re_unpacked, im_unpacked = up_d16.unpack()
+        im_mask = report.layer_reports[0].is_im_neuron
+        self.assertGreater(int(im_mask.sum().item()), 0)
+        self.assertGreater(int((~im_mask).sum().item()), 0)
+        self.assertLess(float((re_unpacked[~im_mask] - up_orig[~im_mask]).abs().max().item()), 1e-6)
+        self.assertLess(float(im_unpacked[~im_mask].abs().max().item()), 1e-6)
+        self.assertLess(float(re_unpacked[im_mask].abs().max().item()), 1e-6)
+        self.assertLess(float((im_unpacked[im_mask] - up_orig[im_mask]).abs().max().item()), 1e-6)
 
     def test_single_branch_d16_rmsnorm_unit_variance_and_complex_gain(self) -> None:
         torch.manual_seed(17)
