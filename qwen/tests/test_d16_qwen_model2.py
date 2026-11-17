@@ -90,6 +90,36 @@ class TestD16EncapsulationAndAutograd(unittest.TestCase):
         self.assertLess(float((bi.grad - bi_ref.grad).abs().max().item()), 1e-12)
 
 
+    def test_d16_complex_tensor_matmul_operator(self) -> None:
+        torch.manual_seed(13)
+        ar = torch.randn(4, 6, dtype=torch.float64, requires_grad=True)
+        ai = torch.randn(4, 6, dtype=torch.float64, requires_grad=True)
+        br = torch.randn(6, 5, dtype=torch.float64, requires_grad=True)
+        bi = torch.randn(6, 5, dtype=torch.float64, requires_grad=True)
+
+        za = D16ComplexTensor.pack(ar, ai)
+        zb = D16ComplexTensor.pack(br, bi)
+        zc = za @ zb
+        out_r, out_i = zc.unpack()
+        loss_d16 = (out_r.square() + 2.0 * out_i.square()).sum()
+        loss_d16.backward()
+
+        ar_ref = ar.detach().clone().requires_grad_(True)
+        ai_ref = ai.detach().clone().requires_grad_(True)
+        br_ref = br.detach().clone().requires_grad_(True)
+        bi_ref = bi.detach().clone().requires_grad_(True)
+        c_r = ar_ref @ br_ref - ai_ref @ bi_ref
+        c_i = ar_ref @ bi_ref + ai_ref @ br_ref
+        loss_ref = (c_r.square() + 2.0 * c_i.square()).sum()
+        loss_ref.backward()
+
+        self.assertLess(float((loss_d16 - loss_ref).abs().item()), 1e-12)
+        self.assertLess(float((ar.grad - ar_ref.grad).abs().max().item()), 1e-12)
+        self.assertLess(float((ai.grad - ai_ref.grad).abs().max().item()), 1e-12)
+        self.assertLess(float((br.grad - br_ref.grad).abs().max().item()), 1e-12)
+        self.assertLess(float((bi.grad - bi_ref.grad).abs().max().item()), 1e-12)
+
+
 class TestD16Model2TrainingAndGeneration(unittest.TestCase):
     """Проверка KV-кэша, генерации и обучения весов D16Parameter через D16AdamW."""
 

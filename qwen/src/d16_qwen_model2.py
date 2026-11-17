@@ -109,18 +109,14 @@ class D16Linear(nn.Module):
 
     def _project_tile(
         self,
-        re: torch.Tensor,
-        im: torch.Tensor,
+        hidden_states: D16ComplexTensor,
         weight: D16ComplexTensor,
         bias: Optional[D16ComplexTensor],
         dtype: torch.dtype,
     ) -> D16ComplexTensor:
-        wr, wi = weight.map_tensors(lambda t: t.transpose(0, 1)).to(re.dtype).unpack()
-        out_re = re @ wr - im @ wi
-        out_im = re @ wi + im @ wr
-        z = D16ComplexTensor.pack(out_re, out_im)
+        z = hidden_states @ weight.to(hidden_states.dtype).transpose(0, 1)
         if bias is not None:
-            z = z + bias.to(re.dtype)
+            z = z + bias.to(hidden_states.dtype)
         return z.to(dtype)
 
     def forward(
@@ -130,10 +126,9 @@ class D16Linear(nn.Module):
         eps: IndiffThreshold = 0.0,
         rel: float = 0.25,
     ) -> D16ComplexTensor:
-        re, im = hidden_states.unpack()
         dtype = torch.promote_types(hidden_states.dtype, self.weight.x.dtype)
         calc_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
-        re, im = re.to(calc_dtype), im.to(calc_dtype)
+        hs = hidden_states.to(calc_dtype)
 
         tiles = []
         tile_size = max(1, self._MAX_WEIGHT_TILE // self.in_features)
@@ -141,7 +136,7 @@ class D16Linear(nn.Module):
         parameter_tiles = zip(self.weight.value().split(tile_size), bias_tiles)
         recompute = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         for parameter_tile in parameter_tiles:
-            args = (re, im, *parameter_tile, dtype)
+            args = (hs, *parameter_tile, dtype)
             if recompute:
                 z = checkpoint(self._project_tile, *args, use_reentrant=False, preserve_rng_state=False)
             else:
@@ -249,16 +244,14 @@ class D16QwenAttention(nn.Module):
         present = (key, value) if use_cache else None
 
         dtype = torch.float64 if query.dtype == torch.float64 else torch.float32
-        q_re, q_im = query.to(dtype).unpack()
-        k_re, k_im = key.to(dtype).map_tensors(lambda t: t.transpose(-1, -2).unsqueeze(2)).unpack()
-        scores_re = (q_re @ k_re) + (q_im @ k_im)
-        scores_im = (q_im @ k_re) - (q_re @ k_im)
-        scores = D16ComplexTensor.pack(scores_re, scores_im) * (head_dim ** -0.5)
+        q = query.to(dtype)
+        k_h = key.to(dtype).conjugate().map_tensors(lambda t: t.transpose(-1, -2).unsqueeze(2))
+        scores = (q @ k_h) * (head_dim ** -0.5)
         allowed = None if attention_mask is None else attention_mask.unsqueeze(2)
         weights = scores.wedge_softmax(allowed, eps=self.indiff_eps, rel=self.indiff_rel)
 
-        v_re, v_im = value.to(dtype).map_tensors(lambda t: t.unsqueeze(2)).unpack()
-        output = D16ComplexTensor.pack(weights.x @ v_re, weights.x @ v_im)
+        v = value.to(dtype).map_tensors(lambda t: t.unsqueeze(2))
+        output = weights @ v
         output = output.map_tensors(
             lambda t: t.permute(0, 3, 1, 2, 4).reshape(batch, length, self.hidden_size)
         )

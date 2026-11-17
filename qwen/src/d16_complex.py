@@ -1296,6 +1296,13 @@ if _HAS_TORCH:
             self.rotation[index].copy_(value.rotation)
             return self
 
+        def transpose(self, dim0: int, dim1: int) -> "D16ComplexTensor":
+            return D16ComplexTensor(
+                self.x.transpose(dim0, dim1),
+                self.y.transpose(dim0, dim1),
+                self.rotation.transpose(dim0, dim1),
+            )
+
         def map_tensors(self, op: Callable[[torch.Tensor], torch.Tensor]) -> "D16ComplexTensor":
             return D16ComplexTensor(op(self.x), op(self.y), op(self.rotation))
 
@@ -1432,6 +1439,37 @@ if _HAS_TORCH:
 
         def __neg__(self) -> "D16ComplexTensor":
             return self.negate()
+
+        def matmul(self, other: "D16ComplexTensor") -> "D16ComplexTensor":
+            """Complex matrix multiplication (@) encapsulated inside D16ComplexTensor."""
+            if not isinstance(other, D16ComplexTensor):
+                return NotImplemented
+            dtype = torch.promote_types(self.dtype, other.dtype)
+            calc_dtype = torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+            ar, ai = self.to(calc_dtype).unpack()
+            br, bi = other.to(calc_dtype).unpack()
+            with torch.autocast(device_type=self.device.type, enabled=False):
+                out_re = ar @ br - ai @ bi
+                out_im = ar @ bi + ai @ br
+            out = D16ComplexTensor.pack(out_re, out_im).to(dtype)
+            if bool(self.is_nan().any()) or bool(other.is_nan().any()):
+                a_nan = self.is_nan().unsqueeze(0) if self.ndim == 1 else self.is_nan()
+                b_nan = other.is_nan().unsqueeze(1) if other.ndim == 1 else other.is_nan()
+                undefined = a_nan.any(dim=-1, keepdim=True) | b_nan.any(dim=-2, keepdim=True)
+                if self.ndim == 1:
+                    undefined = undefined.squeeze(-2)
+                if other.ndim == 1:
+                    undefined = undefined.squeeze(-1)
+                out = D16ComplexTensor(
+                    out.x.masked_fill(undefined, 0.0),
+                    out.y.masked_fill(undefined, 0.0),
+                    out.rotation.masked_fill(undefined, MASK_NAN),
+                )
+            return out
+
+        def __matmul__(self, other: "D16ComplexTensor") -> "D16ComplexTensor":
+            return self.matmul(other)
+
 
         # --- Rotation-Free Wedge Signal & Softmax Operations (Using only x, y in [0°, 22.5°]) ---
 
