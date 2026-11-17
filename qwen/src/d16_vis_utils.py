@@ -212,7 +212,7 @@ def _iter_complex_d16_parameters(
     seen: set[int] = set()
     items: list[Tuple[str, D16Parameter]] = []
     for name, mod in model.named_modules():
-        if not isinstance(mod, D16Parameter):
+        if not (isinstance(mod, D16Parameter) or type(mod).__name__ == "D16Parameter"):
             continue
         if id(mod) in seen:
             continue
@@ -336,8 +336,8 @@ def plot_d16_weight_sector_distribution(
             st_prev = initial_snapshot[name].state().flatten()
             before_counts += torch.bincount(st_prev, minlength=18)
 
-    all_x = torch.cat(xs_list).numpy()
-    all_y = torch.cat(ys_list).numpy()
+    all_x = torch.cat(xs_list).float().numpy()
+    all_y = torch.cat(ys_list).float().numpy()
     all_s = torch.cat(st_list).numpy()
 
     fig = plt.figure(figsize=(14, 5.8))
@@ -734,9 +734,9 @@ def plot_d16_synapse_polar_trajectories(recorder: D16TrajectoryRecorder):
             continue
 
         # Stack [num_steps + 1, num_synapses]
-        re_hist = torch.stack([item[0] for item in history], dim=0).numpy()
-        im_hist = torch.stack([item[1] for item in history], dim=0).numpy()
-        st_hist = torch.stack([item[2] for item in history], dim=0).numpy()
+        re_hist = torch.stack([item[0] for item in history], dim=0).float().numpy()
+        im_hist = torch.stack([item[1] for item in history], dim=0).float().numpy()
+        st_hist = torch.stack([item[2] for item in history], dim=0).float().numpy()
 
         radii = np.hypot(re_hist, im_hist)
         angles = np.mod(np.arctan2(im_hist, re_hist), 2.0 * math.pi)
