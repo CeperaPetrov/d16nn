@@ -1,6 +1,6 @@
 """Standalone 1-to-1 Weight Importer and Fast D16 Checkpoint Save/Load for d16_qwen_model2.
 
-This module keeps `d16_qwen_model2.py` completely untouched and defines:
+This module defines:
 1. `D16QwenImportConfig(D16QwenConfig)`: overrides `complex_hidden_size` so every
    D16Parameter matrix in `D16QwenForCausalLM` has the exact 1-to-1 shape of the
    reference Qwen model (`hidden_size`, `intermediate_size`, `vocab_size`).
@@ -9,9 +9,9 @@ This module keeps `d16_qwen_model2.py` completely untouched and defines:
    above the threshold remain unpaired.
 3. `pack_weights_1to1`: converts any reference weight tensor `W` 1-to-1 into a
    `D16ComplexTensor` at the exact same coordinates `(layer, neuron, synapse)`
-   using the standard `D16ComplexTensor.pack(re, im)` constructor:
-   - Unpaired weights and `Re`-role quartet weights -> `pack(w, 0.0)`
-   - `Im`-role quartet weights                      -> `pack(0.0, w)`
+   using `D16ComplexTensor.pack(re, im)`. In mode `zero` the other coordinate is
+   zero and quartet roles select the source axis. The analytical model import puts
+   the source weight in Re and computes Im with the selected reconstruction function.
 4. `import_qwen_weights`: builds a `D16QwenForCausalLM` instance and imports a
    reference Qwen model (or state_dict / file / directory) 1-to-1.
 5. `save_d16_checkpoint` / `load_d16_checkpoint`: fast serialization and instant
@@ -25,7 +25,8 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple, Union
+import warnings
 
 import torch
 from torch import nn
@@ -273,10 +274,11 @@ class LayerOrbitReport:
     group_ops: torch.Tensor            # [Q, 4] Z_8 |>< Z_2 operation IDs in 0..15
     orbit_scores: torch.Tensor         # [Q] mean cosine similarity per quartet
     active_quartet_mask: torch.Tensor  # [Q] True where quartet score >= min_orbit_score
-    is_im_neuron: torch.Tensor         # [N] True for neurons assigned to Im (placed in y via pack(0, w))
+    is_im_neuron: torch.Tensor         # [N] Im role inferred by the quartet detector
     paired_neuron_mask: torch.Tensor   # [N] True for neurons belonging to an active quartet
     op_histogram: torch.Tensor         # [16] histogram of Z_8 |>< Z_2 operations
     local_2x2: torch.Tensor            # [Q, 4, 2, 2] local 2D projections for compass plots
+    source_im_mask: Optional[torch.Tensor] = None  # [N] where the importer actually placed the Qwen weight in Im
 
     @property
     def mean_orbit_score(self) -> float:
@@ -525,6 +527,32 @@ WEDGE_SAT_SLOPE: float = 0.25 * TAN_PI_8
 WEDGE_HALF_SAT: float = (TAN_PI_8 ** 2) * INV_SQRT2
 
 
+def _adjacent_rope_partner(w: torch.Tensor) -> torch.Tensor:
+    if w.ndim == 0 or w.shape[-1] % 2:
+        raise ValueError(
+            "d16_sat_rope_gate needs an even last dimension for adjacent pairs "
+            "or an explicit partner of the same shape"
+        )
+    pairs = w.reshape(*w.shape[:-1], w.shape[-1] // 2, 2)
+    return torch.stack((-pairs[..., 1], pairs[..., 0]), dim=-1).reshape_as(w)
+
+
+def _rope_gate_direction(
+    w: torch.Tensor, partner: Optional[torch.Tensor], sigma_w: torch.Tensor,
+    sigma_partner: Optional[torch.Tensor], sign: float,
+) -> torch.Tensor:
+    if partner is None:
+        partner = _adjacent_rope_partner(w)
+        sigma_partner = sigma_w
+    else:
+        if partner.shape != w.shape:
+            raise ValueError("RoPE/gate partner must have the same shape as the source weight")
+        partner = partner.to(device=w.device, dtype=torch.float32)
+        if sigma_partner is None:
+            sigma_partner = partner.square().mean().sqrt()
+    return (sign * (partner / sigma_partner.clamp_min(1e-8))).clamp(-3.0, 3.0)
+
+
 @torch.no_grad()
 def compute_d16_second_coord(
     w: torch.Tensor,
@@ -535,8 +563,8 @@ def compute_d16_second_coord(
     c_w0: float = WEDGE_HALF_SAT,
     sign: float = 1.0,
 ) -> torch.Tensor:
-    """Compute the complementary D16 coordinate w2 = f(w1) via D16 radial saturation."""
-    if mode == "zero":
+    """Compute w2 from the source weight's saturation envelope and the selected direction."""
+    if mode == "zero" or c_sat == 0.0:
         return torch.zeros_like(w)
 
     wf = w.detach().to(torch.float32)
@@ -562,14 +590,7 @@ def compute_d16_second_coord(
             parity = torch.where((idx_last & 1) == 0, 1.0, -1.0)
         xi = (sign * (dw / dw_std) * parity).clamp(-3.0, 3.0)
     elif mode == "d16_sat_rope_gate":
-        if partner_w is not None and partner_w.shape == wf.shape:
-            pw = partner_w.detach().to(device=wf.device, dtype=torch.float32)
-            pw_std = pw.square().mean().sqrt().clamp_min(1e-8)
-        else:
-            w_pairs = wf.view(*wf.shape[:-1], wf.shape[-1] // 2, 2)
-            pw = torch.stack([-w_pairs[..., 1], w_pairs[..., 0]], dim=-1).reshape_as(wf)
-            pw_std = sigma_w
-        xi = (sign * (pw / pw_std)).clamp(-3.0, 3.0)
+        xi = _rope_gate_direction(wf, partner_w, sigma_w, None, sign)
     else:
         raise ValueError(f"Unknown second_coord_mode: {mode!r}")
 
@@ -618,14 +639,7 @@ def _compute_w2_slice(
         parity = torch.where(((idx_r + idx_c) & 1) == 0, 1.0, -1.0)
         xi = (sign * (dw / dw_std) * parity).clamp(-3.0, 3.0)
     elif mode == "d16_sat_rope_gate":
-        if partner_slice is not None and partner_slice.shape == wf.shape:
-            pw = partner_slice.to(device=wf.device, dtype=torch.float32)
-            pw_std = (sigma_partner if sigma_partner is not None else pw.square().mean().sqrt()).clamp_min(1e-8)
-        else:
-            w_pairs = wf.view(*wf.shape[:-1], wf.shape[-1] // 2, 2)
-            pw = torch.stack([-w_pairs[..., 1], w_pairs[..., 0]], dim=-1).reshape_as(wf)
-            pw_std = sigma_w.clamp_min(1e-8)
-        xi = (sign * (pw / pw_std)).clamp(-3.0, 3.0)
+        xi = _rope_gate_direction(wf, partner_slice, sigma_w, sigma_partner, sign)
     else:
         raise ValueError(f"Unknown second_coord_mode: {mode!r}")
 
@@ -649,17 +663,18 @@ def _compute_global_sigmas_tiled(
 
     sq_w = torch.zeros((), dtype=torch.float64, device=w.device)
     sq_p = torch.zeros((), dtype=torch.float64, device=w.device)
-    n_rows = w.shape[0]
+    n_rows = w.shape[0] if w.ndim else 1
 
     for start in range(0, n_rows, row_tile):
         end = min(start + row_tile, n_rows)
-        sl = w[start:end].to(dtype).float()
+        rows = slice(start, end) if w.ndim else Ellipsis
+        sl = w[rows].to(dtype).float()
         sq_w += sl.square().sum(dtype=torch.float64)
         if mode == "d16_sat_det" and sl.shape[-1] >= 3:
             dw = torch.roll(sl, -1, dims=-1) - torch.roll(sl, 1, dims=-1)
             sq_p += dw.square().sum(dtype=torch.float64)
         elif mode == "d16_sat_rope_gate" and partner_w is not None:
-            psl = partner_w[start:end].to(device=w.device, dtype=dtype).float()
+            psl = partner_w[rows].to(device=w.device, dtype=dtype).float()
             sq_p += psl.square().sum(dtype=torch.float64)
 
     numel = max(w.numel(), 1)
@@ -698,6 +713,9 @@ def pack_weights_1to1(
         partner_weight = None
     elif partner_weight is not None and partner_weight.shape != w.shape:
         raise ValueError("partner_weight must have the same shape as weight")
+    elif partner_weight is None and w.ndim <= 1 and c_sat != 0.0:
+        # In a vector the tiling axis is also the pairing axis. Preserve pairs across tile boundaries.
+        partner_weight = _adjacent_rope_partner(w)
 
     sigma_w, sigma_partner = _compute_global_sigmas_tiled(
         w, second_coord_mode, partner_weight, dtype=out.dtype, c_sat=c_sat, row_tile=row_tile,
@@ -870,6 +888,13 @@ def import_qwen_weights(
 
     # Validate checkpoint completeness BEFORE allocating or populating the D16 model:
     _validate_qwen_state_dict(state_dict, config)
+    if second_coord_mode == "d16_sat_rope_gate" and c_sat != 0.0:
+        for name, width in (("embed_tokens", config.hidden_size), ("mlp.down_proj", config.intermediate_size)):
+            if width % 2:
+                raise ValueError(
+                    f"{name} has width {width}. Its d16_sat_rope_gate import uses adjacent "
+                    "columns and requires an even last dimension."
+                )
 
     emb_w = _require_tensor(state_dict, "model.embed_tokens.weight", "embed_tokens.weight")
     target_dtype = emb_w.dtype if dtype is None else dtype
@@ -879,8 +904,7 @@ def import_qwen_weights(
         d16_model = D16QwenForCausalLM(config)
     d16_model = d16_model.to(device=target_device)
     if config.complex_hidden_size == config.hidden_size and (config.head_dim % 2) == 0:
-        even_idx = torch.arange(0, config.head_dim, 2, device=target_device)
-        d16_model.model.rotary_emb.frequency_indices.copy_(torch.cat((even_idx, even_idx)))
+        d16_model.model.rotary_emb.use_qwen_half_head_frequencies()
 
     report = ConversionReport(min_orbit_score=min_orbit_score)
 
@@ -956,7 +980,8 @@ def import_qwen_weights(
             min_orbit_score=min_orbit_score,
         )
         report.layer_reports[idx] = layer_rep
-        im_mask = layer_rep.is_im_neuron if second_coord_mode == "zero" else None
+        im_mask = layer_rep.is_im_neuron.clone() if second_coord_mode == "zero" else torch.zeros_like(layer_rep.is_im_neuron)
+        layer_rep.source_im_mask = im_mask
 
         _load_param(layer.mlp.up_proj.weight, up_w, is_im_mask=im_mask, im_dim=0, mode=second_coord_mode, partner_w=gate_w, sign=1.0)
         if layer.mlp.up_proj.bias is not None:
@@ -979,7 +1004,7 @@ def import_qwen_weights(
             print(
                 f"[Слой {idx:2d}/{config.num_hidden_layers - 1:2d}] "
                 f"Четверок >= {min_orbit_score:.2f}: {layer_rep.active_quartets_count:4d}/{layer_rep.quadruplets.shape[0]:<4d} | "
-                f"Re: {layer_rep.re_neurons_count:4d}, Im: {layer_rep.im_neurons_count:4d} | "
+                f"Im по орбитам: {layer_rep.im_neurons_count:4d}, исходный вес в Im: {int(im_mask.sum()):4d} | "
                 f"Ср. Score: {layer_rep.mean_orbit_score:.4f}"
             )
 
@@ -995,17 +1020,18 @@ def print_import_summary(report: ConversionReport) -> None:
     print("=" * 116)
     print(
         f"{'Слой':>4} | {'Всего нейронов':>14} | {'Четверок (>=порога)':>19} | "
-        f"{'В четверках':>12} | {'Без пары (в x)':>14} | {'Роль Re (в x)':>13} | {'Роль Im (в y)':>13} | {'Ср. Score':>9}"
+        f"{'В четверках':>12} | {'Без четверки':>14} | {'Im по орбитам':>13} | {'Вес Qwen в Im':>13} | {'Ср. Score':>9}"
     )
     print("-" * 116)
     for idx in sorted(report.layer_reports.keys()):
         lr = report.layer_reports[idx]
         tot_q = lr.quadruplets.shape[0]
         act_q = lr.active_quartets_count
+        source_im = str(int(lr.source_im_mask.sum())) if lr.source_im_mask is not None else "?"
         print(
             f"{idx:4d} | {lr.orig_intermediate_size:14d} | {act_q:8d} / {tot_q:<8d} | "
             f"{lr.paired_neurons_count:12d} | {lr.unpaired_neurons_count:14d} | "
-            f"{lr.re_neurons_count:13d} | {lr.im_neurons_count:13d} | {lr.mean_orbit_score:9.4f}"
+            f"{lr.im_neurons_count:13d} | {source_im:>13} | {lr.mean_orbit_score:9.4f}"
         )
     print("=" * 116)
     im_pct = 100.0 * report.total_im_weights / max(report.total_weights, 1)
@@ -1013,8 +1039,8 @@ def print_import_summary(report: ConversionReport) -> None:
     print(
         f"ИТОГО ИМПОРТИРОВАНО ТЕНЗОРОВ: {report.total_imported_tensors} | "
         f"ВСЕГО ВЕСОВ D16: {report.total_weights} | "
-        f"В Re (x, y=0): {report.total_re_weights} ({re_pct:.1f}%) | "
-        f"В Im (x=0, y): {report.total_im_weights} ({im_pct:.1f}%)"
+        f"Исходный вес в Re: {report.total_re_weights} ({re_pct:.1f}%) | "
+        f"Исходный вес в Im: {report.total_im_weights} ({im_pct:.1f}%)"
     )
     print("=" * 116)
 
@@ -1069,6 +1095,7 @@ def _serialize_report(report: ConversionReport) -> Dict[str, Any]:
                 "orbit_scores": lr.orbit_scores.cpu(),
                 "active_quartet_mask": lr.active_quartet_mask.cpu(),
                 "is_im_neuron": lr.is_im_neuron.cpu(),
+                "source_im_mask": lr.source_im_mask.cpu() if lr.source_im_mask is not None else None,
                 "paired_neuron_mask": lr.paired_neuron_mask.cpu(),
                 "op_histogram": lr.op_histogram.cpu(),
                 "local_2x2": lr.local_2x2.cpu(),
@@ -1087,6 +1114,11 @@ def _deserialize_report(data: Mapping[str, Any]) -> ConversionReport:
         total_im_weights=int(data.get("total_im_weights", 0)),
     )
     for idx_k, lr_d in data.get("layer_reports", {}).items():
+        source_im = lr_d.get("source_im_mask")
+        if "source_im_mask" not in lr_d and "total_im_weights" in data:
+            # Historical imports either applied the detected roles throughout or put every source weight in Re.
+            roles = lr_d["is_im_neuron"]
+            source_im = roles.clone() if rep.total_im_weights else torch.zeros_like(roles)
         rep.layer_reports[int(idx_k)] = LayerOrbitReport(
             layer_idx=int(lr_d["layer_idx"]),
             mode=str(lr_d["mode"]),
@@ -1100,6 +1132,7 @@ def _deserialize_report(data: Mapping[str, Any]) -> ConversionReport:
             paired_neuron_mask=lr_d["paired_neuron_mask"],
             op_histogram=lr_d["op_histogram"],
             local_2x2=lr_d["local_2x2"],
+            source_im_mask=source_im,
         )
     return rep
 
@@ -1164,8 +1197,11 @@ def load_d16_checkpoint(
     device: Union[str, torch.device] = "cpu",
     dtype: Optional[torch.dtype] = None,
     return_report: bool = False,
+    legacy_rope_layout: Optional[Literal["sequential", "half_head"]] = None,
 ) -> Union[D16QwenForCausalLM, Tuple[D16QwenForCausalLM, Optional[ConversionReport]]]:
-    """Instantly load a packed `D16QwenForCausalLM` checkpoint without quartet search or random init."""
+    """Load the stored RoPE grid. For unmarked files select the grid used to produce the checkpoint."""
+    if legacy_rope_layout not in (None, "sequential", "half_head"):
+        raise ValueError("legacy_rope_layout must be 'sequential' or 'half_head'")
     target = Path(load_path).expanduser()
     target_device = torch.device(device)
     report: Optional[ConversionReport] = None
@@ -1186,8 +1222,7 @@ def load_d16_checkpoint(
         pt_file = target / "d16_model.pt"
         if st_file.is_file():
             from safetensors.torch import load_file
-            st_dev = "cpu" #f"cuda:{torch.cuda.current_device()}" if target_device.type == "cuda" and target_device.index is None else str(target_device)
-            state_dict = load_file(str(st_file), device=st_dev)
+            state_dict = load_file(str(st_file), device="cpu")
         elif pt_file.is_file():
             state_dict = torch.load(str(pt_file), map_location="cpu", weights_only=True)
         else:
@@ -1213,9 +1248,15 @@ def load_d16_checkpoint(
     with _fast_empty_d16_init(dtype=target_dtype, device=target_device):
         d16_model = D16QwenForCausalLM(config)
     d16_model = d16_model.to(device=target_device)
-    if config.complex_hidden_size == config.hidden_size and (config.head_dim % 2) == 0:
-        even_idx = torch.arange(0, config.head_dim, 2, device=target_device)
-        d16_model.model.rotary_emb.frequency_indices.copy_(torch.cat((even_idx, even_idx)))
+    if "model.rotary_emb.frequency_indices" not in state_dict:
+        if legacy_rope_layout == "half_head":
+            d16_model.model.rotary_emb.use_qwen_half_head_frequencies()
+        elif legacy_rope_layout is None and config.complex_hidden_size == config.hidden_size and config.head_dim % 2 == 0:
+            warnings.warn(
+                "This legacy checkpoint has no saved RoPE grid. Using sequential indices. "
+                "Pass legacy_rope_layout='half_head' if it was imported with Qwen half-head frequencies.",
+                UserWarning, stacklevel=2,
+            )
 
     # Cast floating-point coordinates (x, y) if an explicit dtype override was requested
     if dtype is not None:
