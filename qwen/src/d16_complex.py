@@ -1305,9 +1305,10 @@ if _HAS_TORCH:
         ) -> "D16ComplexTensor":
             """Make an independent, contiguous value for a parameter or optimizer state."""
             rotation = self.rotation
-            if rotation.dtype not in (torch.int32, torch.int64, torch.uint16):
+            _valid_rot_dtypes = (torch.int32, torch.int64) + ((torch.uint16,) if hasattr(torch, 'uint16') else ())
+            if rotation.dtype not in _valid_rot_dtypes:
                 raise ValueError("D16 storage requires a uint16, int32 or int64 sector mask")
-            if rotation.dtype != torch.uint16 and not rotation.is_meta and rotation.numel():
+            if rotation.dtype != getattr(torch, 'uint16', None) and not rotation.is_meta and rotation.numel():
                 low, high = torch.aminmax(rotation)
                 if low.item() < 0 or high.item() > MASK_ZERO:
                     raise ValueError("D16 sector mask is outside the unsigned 16-bit range")
