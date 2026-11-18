@@ -1602,12 +1602,13 @@ if _HAS_TORCH:
                 above_cutoff = active & (cut_strength > 0.0)
                 has_survivor = above_cutoff.any(dim=-1, keepdim=True)
                 eff_active = torch.where(has_survivor, above_cutoff, active)
+                eff_strength = torch.where(target_mask | ~has_survivor, raw_strength, cut_strength)
             else:
                 eff_active = active
+                eff_strength = raw_strength
 
             # Целевой токен всегда участвует со своим живым сигналом raw_strength и живым градиентом:
-            eff_active = eff_active | (target_mask & active)
-            eff_strength = torch.where(target_mask, raw_strength, cut_strength)
+            eff_active = eff_active | (target_mask & active)            
             selected = raw_strength.gather(-1, addresses).squeeze(-1)
 
             masked_strength = torch.where(eff_active, eff_strength, -float("inf"))

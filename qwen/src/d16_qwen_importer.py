@@ -590,6 +590,45 @@ def _compute_w2_slice(
 
 
 @torch.no_grad()
+def _compute_global_sigmas_tiled(
+    w: torch.Tensor,
+    mode: str,
+    partner_w: Optional[torch.Tensor] = None,
+    *,
+    c_sat: float = 0.090,
+    row_tile: int = _PACK_ROW_TILE,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute global RMS statistics (sigma_w, sigma_partner) in row tiles without full-matrix allocation."""
+    if mode == "zero" or c_sat == 0.0 or w.ndim < 2:
+        one = torch.ones((), dtype=torch.float32, device=w.device)
+        return one, one
+
+    sq_w = torch.zeros((), dtype=torch.float64, device=w.device)
+    sq_p = torch.zeros((), dtype=torch.float64, device=w.device)
+    n_rows = w.shape[0]
+
+    for start in range(0, n_rows, row_tile):
+        end = min(start + row_tile, n_rows)
+        sl = w[start:end].to(torch.float32)
+        sq_w += sl.square().sum(dtype=torch.float64)
+        if mode == "d16_sat_det" and sl.shape[-1] >= 3:
+            dw = torch.roll(sl, -1, dims=-1) - torch.roll(sl, 1, dims=-1)
+            sq_p += dw.square().sum(dtype=torch.float64)
+        elif mode == "d16_sat_rope_gate" and partner_w is not None:
+            psl = partner_w[start:end].to(device=w.device, dtype=torch.float32)
+            sq_p += psl.square().sum(dtype=torch.float64)
+
+    numel = max(w.numel(), 1)
+    sigma_w = (sq_w / numel).sqrt().to(torch.float32).clamp_min(1e-8)
+    sigma_p = (
+        (sq_p / numel).sqrt().to(torch.float32).clamp_min(1e-8)
+        if float(sq_p.item()) > 0.0
+        else sigma_w
+    )
+    return sigma_w, sigma_p
+
+
+@torch.no_grad()
 def pack_weights_1to1(
     weight: torch.Tensor,
     is_im_mask: Optional[torch.Tensor] = None,
@@ -607,22 +646,14 @@ def pack_weights_1to1(
     has_im = is_im_mask is not None and bool(is_im_mask.any())
     mask_full = is_im_mask.to(device=w.device, dtype=torch.bool) if has_im else None
 
-    # Compute global matrix RMS statistics once across the entire tensor so tiling never alters values:
-    if second_coord_mode != "zero" and w.ndim >= 2 and c_sat != 0.0:
-        wf_all = w.to(torch.float32)
-        sigma_w = wf_all.square().mean().sqrt().clamp_min(1e-8)
-        if second_coord_mode == "d16_sat_det" and wf_all.shape[-1] >= 3:
-            dw_all = torch.roll(wf_all, -1, dims=-1) - torch.roll(wf_all, 1, dims=-1)
-            sigma_partner: Optional[torch.Tensor] = dw_all.square().mean().sqrt().clamp_min(1e-8)
-            del dw_all
-        elif second_coord_mode == "d16_sat_rope_gate" and partner_weight is not None:
-            sigma_partner = partner_weight.detach().to(torch.float32).square().mean().sqrt().clamp_min(1e-8)
-        else:
-            sigma_partner = sigma_w
-        del wf_all
-    else:
-        sigma_w = torch.ones((), dtype=torch.float32, device=w.device)
-        sigma_partner = sigma_w
+    # Compute global matrix RMS statistics in tiles so peak memory stays bounded:
+    sigma_w, sigma_partner = _compute_global_sigmas_tiled(
+        w,
+        second_coord_mode,
+        partner_weight,
+        c_sat=c_sat,
+        row_tile=row_tile,
+    )
 
     # 1D vectors or small 2D matrices fit in a single tile:
     if w.ndim < 2 or w.shape[0] <= row_tile:
@@ -826,21 +857,11 @@ def import_qwen_weights(
         if w.ndim >= 2 and w.shape[0] > _PACK_ROW_TILE:
             has_im = is_im_mask is not None and bool(is_im_mask.any())
             mask_full = is_im_mask.to(device=target_device, dtype=torch.bool) if has_im else None
-            if mode != "zero" and c_sat != 0.0:
-                wf_all = w.to(torch.float32)
-                sigma_w = wf_all.square().mean().sqrt().clamp_min(1e-8).to(target_device)
-                if mode == "d16_sat_det" and wf_all.shape[-1] >= 3:
-                    dw_all = torch.roll(wf_all, -1, dims=-1) - torch.roll(wf_all, 1, dims=-1)
-                    sigma_p = dw_all.square().mean().sqrt().clamp_min(1e-8).to(target_device)
-                    del dw_all
-                elif mode == "d16_sat_rope_gate" and partner_w is not None:
-                    sigma_p = partner_w.to(torch.float32).square().mean().sqrt().clamp_min(1e-8).to(target_device)
-                else:
-                    sigma_p = sigma_w
-                del wf_all
-            else:
-                sigma_w = torch.ones((), dtype=torch.float32, device=target_device)
-                sigma_p = sigma_w
+            sigma_w, sigma_p = _compute_global_sigmas_tiled(
+                w, mode, partner_w, c_sat=c_sat, row_tile=_PACK_ROW_TILE
+            )
+            sigma_w = sigma_w.to(target_device)
+            sigma_p = sigma_p.to(target_device)
 
             for start in range(0, w.shape[0], _PACK_ROW_TILE):
                 end = min(start + _PACK_ROW_TILE, w.shape[0])
