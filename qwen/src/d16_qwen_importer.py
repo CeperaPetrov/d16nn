@@ -31,7 +31,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from d16_complex import D16ComplexTensor, INV_SQRT2
+from d16_complex import D16ComplexTensor, INV_SQRT2, TAN_PI_8
 from d16_parameter import D16Parameter
 from d16_qwen_model2 import D16QwenConfig, D16QwenForCausalLM, IndiffThreshold, MLPActivation
 
@@ -503,40 +503,48 @@ def find_mlp_quartets(
 
 _PACK_ROW_TILE: int = 4096
 
+# Фундаментальные геометрические константы реконструкции 2-й координаты в клине [0°, 22.5°]:
+# - WEDGE_SAT_SLOPE = TAN_PI_8 / 4 : четверть биссектрисы клина (после билинейного умножения даёт середину клина TAN_PI_8 / 2)
+# - WEDGE_HALF_SAT  = (TAN_PI_8 ** 2) * INV_SQRT2 : радиус полунасыщения в единицах глобального RMS матрицы
+WEDGE_SAT_SLOPE: float = 0.25 * TAN_PI_8
+WEDGE_HALF_SAT: float = (TAN_PI_8 ** 2) * INV_SQRT2
+
+
 @torch.no_grad()
 def compute_d16_second_coord(
     w: torch.Tensor,
-    mode: str = "d16_sat_det",
+    mode: str = "d16_sat_rope_gate",
     *,
-    c_sat: float = 0.205,
-    c_w0: float = 0.120,
+    partner_w: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Compute the complementary D16 coordinate w2 = f(w1) via D16 radial saturation."""
-    if mode == "zero":
+    """Compute the complementary D16 coordinate w2 = f(w1) via D16 radial wedge saturation."""
+    if mode == "zero" or w.ndim < 2:
         return torch.zeros_like(w)
 
     wf = w.detach().to(torch.float32)
     sigma_w = wf.square().mean().sqrt().clamp_min(1e-8)
-    y_sat = c_sat * sigma_w
-    w0 = c_w0 * sigma_w
+    y_sat = WEDGE_SAT_SLOPE * sigma_w
+    w0 = WEDGE_HALF_SAT * sigma_w
     envelope = y_sat * (wf.abs() / (w0 + wf.abs()))
 
     if mode == "d16_sat_rand":
         xi = torch.randn_like(wf)
     elif mode == "d16_sat_det":
-        if wf.shape[-1] >= 3:
-            dw = torch.roll(wf, -1, dims=-1) - torch.roll(wf, 1, dims=-1)
-        else:
-            dw = wf.clone()
+        dw = torch.roll(wf, -1, dims=-1) - torch.roll(wf, 1, dims=-1) if wf.shape[-1] >= 3 else wf.clone()
         dw_std = dw.square().mean().sqrt().clamp_min(1e-8)
-        # Шахматная чётность (-1)^(i+j) гарантирует идеальную симметрию S0=S15 и S7=S8
-        idx_last = torch.arange(wf.shape[-1], device=wf.device)
-        if wf.ndim >= 2:
-            idx_prev = torch.arange(wf.shape[-2], device=wf.device).unsqueeze(-1)
-            parity = torch.where(((idx_prev + idx_last) & 1) == 0, 1.0, -1.0)
+        idx_r = torch.arange(wf.shape[-2], device=wf.device).unsqueeze(-1)
+        idx_c = torch.arange(wf.shape[-1], device=wf.device)
+        parity = torch.where(((idx_r + idx_c) & 1) == 0, 1.0, -1.0)
+        xi = ((dw / dw_std) * parity).clamp(-3.0, 3.0)
+    elif mode == "d16_sat_rope_gate":
+        if partner_w is not None and partner_w.shape == wf.shape:
+            pw = partner_w.detach().to(device=wf.device, dtype=torch.float32)
+            pw_std = pw.square().mean().sqrt().clamp_min(1e-8)
         else:
-            parity = torch.where((idx_last & 1) == 0, 1.0, -1.0)
-        xi = (dw / dw_std) * parity
+            w_pairs = wf.view(*wf.shape[:-1], wf.shape[-1] // 2, 2)
+            pw = torch.stack([-w_pairs[..., 1], w_pairs[..., 0]], dim=-1).reshape_as(wf)
+            pw_std = sigma_w
+        xi = (pw / pw_std).clamp(-3.0, 3.0)
     else:
         raise ValueError(f"Unknown second_coord_mode: {mode!r}")
 
@@ -552,17 +560,14 @@ def _compute_w2_slice(
     partner_slice: Optional[torch.Tensor] = None,
     sigma_partner: Optional[torch.Tensor] = None,
     row_offset: int = 0,
-    c_sat: float = 0.090,
-    c_w0: float = 0.120,
-    sign: float = 1.0,
 ) -> torch.Tensor:
     """Compute 2nd coordinate w2 for a row slice using global matrix statistics (sigma_w, sigma_partner)."""
-    if mode == "zero" or c_sat == 0.0 or w_slice.ndim < 2:
+    if mode == "zero" or w_slice.ndim < 2:
         return torch.zeros_like(w_slice)
 
     wf = w_slice.to(torch.float32)
-    y_sat = c_sat * sigma_w
-    w0 = c_w0 * sigma_w
+    y_sat = WEDGE_SAT_SLOPE * sigma_w
+    w0 = WEDGE_HALF_SAT * sigma_w
     envelope = y_sat * (wf.abs() / (w0 + wf.abs()))
 
     if mode == "d16_sat_rand":
@@ -573,7 +578,7 @@ def _compute_w2_slice(
         idx_r = torch.arange(row_offset, row_offset + wf.shape[-2], device=wf.device).unsqueeze(-1)
         idx_c = torch.arange(wf.shape[-1], device=wf.device)
         parity = torch.where(((idx_r + idx_c) & 1) == 0, 1.0, -1.0)
-        xi = (sign * (dw / dw_std) * parity).clamp(-3.0, 3.0)
+        xi = ((dw / dw_std) * parity).clamp(-3.0, 3.0)
     elif mode == "d16_sat_rope_gate":
         if partner_slice is not None and partner_slice.shape == wf.shape:
             pw = partner_slice.to(device=wf.device, dtype=torch.float32)
@@ -582,7 +587,7 @@ def _compute_w2_slice(
             w_pairs = wf.view(*wf.shape[:-1], wf.shape[-1] // 2, 2)
             pw = torch.stack([-w_pairs[..., 1], w_pairs[..., 0]], dim=-1).reshape_as(wf)
             pw_std = sigma_w.clamp_min(1e-8)
-        xi = (sign * (pw / pw_std)).clamp(-3.0, 3.0)
+        xi = (pw / pw_std).clamp(-3.0, 3.0)
     else:
         raise ValueError(f"Unknown second_coord_mode: {mode!r}")
 
@@ -595,11 +600,10 @@ def _compute_global_sigmas_tiled(
     mode: str,
     partner_w: Optional[torch.Tensor] = None,
     *,
-    c_sat: float = 0.090,
     row_tile: int = _PACK_ROW_TILE,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute global RMS statistics (sigma_w, sigma_partner) in row tiles without full-matrix allocation."""
-    if mode == "zero" or c_sat == 0.0 or w.ndim < 2:
+    if mode == "zero" or w.ndim < 2:
         one = torch.ones((), dtype=torch.float32, device=w.device)
         return one, one
 
@@ -634,11 +638,8 @@ def pack_weights_1to1(
     is_im_mask: Optional[torch.Tensor] = None,
     *,
     im_dim: int = 0,
-    second_coord_mode: str = "zero",
+    second_coord_mode: str = "d16_sat_rope_gate",
     partner_weight: Optional[torch.Tensor] = None,
-    c_sat: float = 0.090,
-    c_w0: float = 0.120,
-    sign: float = 1.0,
     row_tile: int = _PACK_ROW_TILE,
 ) -> D16ComplexTensor:
     """Convert a real weight tensor 1-to-1 into a `D16ComplexTensor` in memory-bounded row tiles."""
@@ -646,16 +647,13 @@ def pack_weights_1to1(
     has_im = is_im_mask is not None and bool(is_im_mask.any())
     mask_full = is_im_mask.to(device=w.device, dtype=torch.bool) if has_im else None
 
-    # Compute global matrix RMS statistics in tiles so peak memory stays bounded:
     sigma_w, sigma_partner = _compute_global_sigmas_tiled(
         w,
         second_coord_mode,
         partner_weight,
-        c_sat=c_sat,
         row_tile=row_tile,
     )
 
-    # 1D vectors or small 2D matrices fit in a single tile:
     if w.ndim < 2 or w.shape[0] <= row_tile:
         w2 = _compute_w2_slice(
             w,
@@ -664,16 +662,12 @@ def pack_weights_1to1(
             partner_slice=partner_weight,
             sigma_partner=sigma_partner,
             row_offset=0,
-            c_sat=c_sat,
-            c_w0=c_w0,
-            sign=sign,
         )
         if not has_im or mask_full is None:
             return D16ComplexTensor.pack(w, w2)
         m = (mask_full.unsqueeze(1) if im_dim == 0 else mask_full.unsqueeze(0)) if (w.ndim == 2 and mask_full.ndim == 1) else mask_full
         return D16ComplexTensor.pack(torch.where(m, w2, w), torch.where(m, w, w2))
 
-    # Tiled packing along dim 0 (caps peak VRAM on 151936x896 embed_tokens from ~14 GiB to ~350 MiB):
     out = D16ComplexTensor.zeros(tuple(w.shape), dtype=w.dtype, device=w.device)
     n_rows = w.shape[0]
     for start in range(0, n_rows, row_tile):
@@ -687,9 +681,6 @@ def pack_weights_1to1(
             partner_slice=p_sl,
             sigma_partner=sigma_partner,
             row_offset=start,
-            c_sat=c_sat,
-            c_w0=c_w0,
-            sign=sign,
         )
         if not has_im or mask_full is None:
             packed_sl = D16ComplexTensor.pack(w_sl, w2_sl)
@@ -800,15 +791,12 @@ def import_qwen_weights(
     indiff_eps: IndiffThreshold = 0.0,
     indiff_rel: float = 0.25,
     mlp_activation: MLPActivation = "bilinear",
-    second_coord_mode: str = "zero",
-    c_sat: float = 0.090,
-    c_w0: float = 0.120,
+    second_coord_mode: str = "d16_sat_rope_gate",
     dtype: Optional[torch.dtype] = None,
     device: Optional[Union[str, torch.device]] = None,
     verbose: bool = True,
 ) -> Tuple[D16QwenForCausalLM, ConversionReport]:
     """Import weights 1-to-1 from a Qwen file/folder/model/state_dict into `d16_qwen_model2.D16QwenForCausalLM`."""
-    # Load raw checkpoint onto CPU first to avoid doubling GPU VRAM during import:
     state_dict, cfg_dict = load_qwen_checkpoint(source, device="cpu")
 
     if config is None:
@@ -829,7 +817,6 @@ def import_qwen_weights(
                 mlp_activation=mlp_activation,
             )
 
-    # Validate checkpoint completeness BEFORE allocating or populating the D16 model:
     _validate_qwen_state_dict(state_dict, config)
 
     sample_t = next(iter(state_dict.values()))
@@ -850,15 +837,13 @@ def import_qwen_weights(
         *,
         mode: str = "zero",
         partner_w: Optional[torch.Tensor] = None,
-        sign: float = 1.0,
     ) -> None:
         n_el = w.numel()
-        # Stream-pack in row tiles so huge tensors (embed_tokens) never allocate full-matrix temporaries on GPU:
         if w.ndim >= 2 and w.shape[0] > _PACK_ROW_TILE:
             has_im = is_im_mask is not None and bool(is_im_mask.any())
             mask_full = is_im_mask.to(device=target_device, dtype=torch.bool) if has_im else None
             sigma_w, sigma_p = _compute_global_sigmas_tiled(
-                w, mode, partner_w, c_sat=c_sat, row_tile=_PACK_ROW_TILE
+                w, mode, partner_w, row_tile=_PACK_ROW_TILE
             )
             sigma_w = sigma_w.to(target_device)
             sigma_p = sigma_p.to(target_device)
@@ -874,9 +859,6 @@ def import_qwen_weights(
                     partner_slice=p_sl,
                     sigma_partner=sigma_p,
                     row_offset=start,
-                    c_sat=c_sat,
-                    c_w0=c_w0,
-                    sign=sign,
                 )
                 if not has_im or mask_full is None:
                     packed_sl = D16ComplexTensor.pack(w_sl, w2_sl)
@@ -893,9 +875,6 @@ def import_qwen_weights(
                 im_dim=im_dim,
                 second_coord_mode=mode,
                 partner_weight=target_p,
-                c_sat=c_sat,
-                c_w0=c_w0,
-                sign=sign,
             )
             param.copy_(d16_val)
 
@@ -911,16 +890,16 @@ def import_qwen_weights(
         report.total_im_weights += im_cnt
         report.total_re_weights += n_el - im_cnt
 
-    # 1. Embeddings (kept on the reference 0° axis), Final Norm, LM Head
+    # 1. Embeddings, Final Norm, LM Head
     emb_w = _require_tensor(state_dict, "model.embed_tokens.weight", "embed_tokens.weight")
-    _load_param(d16_model.model.embed_tokens.weight, emb_w, mode="zero")
+    _load_param(d16_model.model.embed_tokens.weight, emb_w, mode=second_coord_mode)
 
     norm_w = _require_tensor(state_dict, "model.norm.weight", "norm.weight")
     _load_param(d16_model.model.norm.gain, norm_w, mode="zero")
 
     if not config.tie_word_embeddings:
         lm_w = _require_tensor(state_dict, "lm_head.weight")
-        _load_param(d16_model.lm_head.weight, lm_w, mode="zero")
+        _load_param(d16_model.lm_head.weight, lm_w, mode=second_coord_mode)
 
     # 2. Decoder Layers
     for idx, layer in enumerate(d16_model.model.layers):
@@ -936,7 +915,7 @@ def import_qwen_weights(
         for proj_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
             proj_mod = getattr(layer.self_attn, proj_name)
             pw = _require_tensor(state_dict, f"{p_m}.self_attn.{proj_name}.weight", f"{p_s}.self_attn.{proj_name}.weight")
-            _load_param(proj_mod.weight, pw, mode=second_coord_mode, sign=1.0)
+            _load_param(proj_mod.weight, pw, mode=second_coord_mode)
             if proj_mod.bias is not None:
                 pb = _get_tensor(state_dict, f"{p_m}.self_attn.{proj_name}.bias", f"{p_s}.self_attn.{proj_name}.bias")
                 if pb is not None:
@@ -956,19 +935,19 @@ def import_qwen_weights(
         report.layer_reports[idx] = layer_rep
         im_mask = layer_rep.is_im_neuron
 
-        _load_param(layer.mlp.up_proj.weight, up_w, is_im_mask=im_mask, im_dim=0, mode=second_coord_mode, partner_w=gate_w, sign=1.0)
+        _load_param(layer.mlp.up_proj.weight, up_w, is_im_mask=im_mask, im_dim=0, mode=second_coord_mode, partner_w=gate_w)
         if layer.mlp.up_proj.bias is not None:
             up_b = _require_tensor(state_dict, f"{p_m}.mlp.up_proj.bias", f"{p_s}.mlp.up_proj.bias")
             _load_param(layer.mlp.up_proj.bias, up_b, is_im_mask=im_mask, im_dim=0, mode="zero")
 
         if layer.mlp.gate_proj is not None:
             gate_req = _require_tensor(state_dict, f"{p_m}.mlp.gate_proj.weight", f"{p_s}.mlp.gate_proj.weight")
-            _load_param(layer.mlp.gate_proj.weight, gate_req, is_im_mask=im_mask, im_dim=0, mode=second_coord_mode, partner_w=up_w, sign=-1.0)
+            _load_param(layer.mlp.gate_proj.weight, gate_req, is_im_mask=im_mask, im_dim=0, mode=second_coord_mode, partner_w=up_w)
             if layer.mlp.gate_proj.bias is not None:
                 gate_b = _require_tensor(state_dict, f"{p_m}.mlp.gate_proj.bias", f"{p_s}.mlp.gate_proj.bias")
                 _load_param(layer.mlp.gate_proj.bias, gate_b, is_im_mask=im_mask, im_dim=0, mode="zero")
 
-        _load_param(layer.mlp.down_proj.weight, down_w, is_im_mask=im_mask, im_dim=1, mode=second_coord_mode, sign=1.0)
+        _load_param(layer.mlp.down_proj.weight, down_w, is_im_mask=im_mask, im_dim=1, mode=second_coord_mode)
         if layer.mlp.down_proj.bias is not None:
             down_b = _require_tensor(state_dict, f"{p_m}.mlp.down_proj.bias", f"{p_s}.mlp.down_proj.bias")
             _load_param(layer.mlp.down_proj.bias, down_b, mode="zero")
