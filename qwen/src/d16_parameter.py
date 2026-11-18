@@ -16,13 +16,10 @@ class D16Parameter(nn.Module):
         super().__init__()
         if not isinstance(value, D16ComplexTensor):
             raise TypeError("D16Parameter expects a D16ComplexTensor value")
-        # Гарантируем собственное изменяемое contiguous-хранилище без shared memory / broadcast views:
-        x_buf = value.x.detach().clone().contiguous()
-        y_buf = value.y.detach().clone().contiguous()
-        rot_buf = value.rotation.detach().clone().contiguous()
-        self.x = nn.Parameter(x_buf, requires_grad=requires_grad)
-        self.y = nn.Parameter(y_buf, requires_grad=requires_grad)
-        self.register_buffer("rotation", rot_buf)
+        stored = value.storage_copy()
+        self.x = nn.Parameter(stored.x, requires_grad=requires_grad)
+        self.y = nn.Parameter(stored.y, requires_grad=requires_grad)
+        self.register_buffer("rotation", stored.rotation)
 
     @classmethod
     def zeros(cls, shape: tuple[int, ...]) -> "D16Parameter":

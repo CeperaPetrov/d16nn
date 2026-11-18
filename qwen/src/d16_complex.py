@@ -1299,6 +1299,26 @@ if _HAS_TORCH:
         def clone(self) -> "D16ComplexTensor":
             return D16ComplexTensor(self.x.clone(), self.y.clone(), self.rotation.clone())
 
+        @torch.no_grad()
+        def storage_copy(
+            self, *, device: Optional[Union[str, torch.device]] = None, dtype: Optional[torch.dtype] = None,
+        ) -> "D16ComplexTensor":
+            """Make an independent, contiguous value for a parameter or optimizer state."""
+            rotation = self.rotation
+            if rotation.dtype not in (torch.int32, torch.int64, torch.uint16):
+                raise ValueError("D16 storage requires a uint16, int32 or int64 sector mask")
+            if rotation.dtype != torch.uint16 and not rotation.is_meta and rotation.numel():
+                low, high = torch.aminmax(rotation)
+                if low.item() < 0 or high.item() > MASK_ZERO:
+                    raise ValueError("D16 sector mask is outside the unsigned 16-bit range")
+            options = dict(device=device, copy=True, memory_format=torch.contiguous_format)
+            target_dtype = self.dtype if dtype is None else dtype
+            return D16ComplexTensor(
+                self.x.to(dtype=target_dtype, **options),
+                self.y.to(dtype=target_dtype, **options),
+                rotation.to(dtype=torch.int32, **options),
+            )
+
         def detach(self) -> "D16ComplexTensor":
             return D16ComplexTensor(self.x.detach(), self.y.detach(), self.rotation.detach())
 
@@ -1575,6 +1595,26 @@ if _HAS_TORCH:
                 raise ValueError("Cannot select a token from undefined logits")
             return address
 
+        def sampling_probabilities(
+            self, temperature: float = 1.0, *, eps: Union[float, torch.Tensor, str] = 0.0, rel: float = 0.25
+        ) -> "D16ComplexTensor":
+            """Return the distribution used to sample the next token."""
+            scaled = self.to(torch.float32) * (1.0 / max(temperature, 1e-5))
+            return scaled.wedge_softmax(eps=eps, rel=rel)
+
+        @torch.no_grad()
+        def sampling_nll(
+            self, targets: torch.Tensor, temperature: float = 1.0, *,
+            eps: Union[float, torch.Tensor, str] = 0.0, rel: float = 0.25,
+        ) -> torch.Tensor:
+            """Mean sampling NLL. Ignored targets (-100) do not contribute; zero probability gives +inf."""
+            probabilities = self.sampling_probabilities(temperature, eps=eps, rel=rel)
+            valid = targets != -100
+            indices = targets.masked_fill(~valid, 0).unsqueeze(-1)
+            selected = probabilities.map_tensors(lambda t: t.gather(-1, indices).squeeze(-1))
+            p = selected.x.to(torch.float64).masked_fill(selected.is_nan(), float("nan"))
+            return (-p.log()).masked_fill(~valid, 0.0).sum() / valid.sum()
+
         def wedge_cross_entropy(
             self,
             targets: torch.Tensor,
@@ -1582,7 +1622,7 @@ if _HAS_TORCH:
             eps: Union[float, torch.Tensor, str] = 0.0,
             rel: float = 0.25,
         ) -> "D16ComplexTensor":
-            """Mean negative log-likelihood from rotation-free wedge signal strength (x, y)."""
+            """Training loss that keeps the target active so weak signals receive a gradient."""
             undefined = self.is_nan()
             active = ~undefined
             valid = targets != -100

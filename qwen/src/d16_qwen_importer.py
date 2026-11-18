@@ -31,7 +31,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from d16_complex import D16ComplexTensor, INV_SQRT2, TAN_PI_8
+from d16_complex import D16ComplexTensor, INV_SQRT2
 from d16_parameter import D16Parameter
 from d16_qwen_model2 import D16QwenConfig, D16QwenForCausalLM, IndiffThreshold, MLPActivation
 
@@ -112,11 +112,15 @@ class D16QwenImportConfig(D16QwenConfig):
         embed_w = state_dict.get("model.embed_tokens.weight", state_dict.get("embed_tokens.weight"))
         if embed_w is None:
             raise ValueError("state_dict must contain 'model.embed_tokens.weight'")
+        if not isinstance(embed_w, torch.Tensor) or embed_w.ndim != 2 or min(embed_w.shape) < 1:
+            raise ValueError("model.embed_tokens.weight must be a nonempty matrix")
         vocab_size, hidden_size = int(embed_w.shape[0]), int(embed_w.shape[1])
 
         up_w = state_dict.get("model.layers.0.mlp.up_proj.weight", state_dict.get("layers.0.mlp.up_proj.weight"))
         if up_w is None:
             raise ValueError("state_dict must contain 'model.layers.0.mlp.up_proj.weight'")
+        if not isinstance(up_w, torch.Tensor) or up_w.ndim != 2:
+            raise ValueError("model.layers.0.mlp.up_proj.weight must be a matrix")
         intermediate_size = int(up_w.shape[0])
 
         layer_indices = set()
@@ -126,11 +130,18 @@ class D16QwenImportConfig(D16QwenConfig):
                 if p == "layers" and i + 1 < len(parts) and parts[i + 1].isdigit():
                     layer_indices.add(int(parts[i + 1]))
         detected_layers = max(layer_indices) + 1 if layer_indices else 1
-        layers = detected_layers if num_hidden_layers is None else min(int(num_hidden_layers), detected_layers)
+        layers = detected_layers if num_hidden_layers is None else int(num_hidden_layers)
 
         k_w = state_dict.get("model.layers.0.self_attn.k_proj.weight", state_dict.get("layers.0.self_attn.k_proj.weight"))
-        q_b = state_dict.get("model.layers.0.self_attn.q_proj.bias", state_dict.get("layers.0.self_attn.q_proj.bias"))
-        up_b = state_dict.get("model.layers.0.mlp.up_proj.bias", state_dict.get("layers.0.mlp.up_proj.bias"))
+        if k_w is not None and (not isinstance(k_w, torch.Tensor) or k_w.ndim != 2):
+            raise ValueError("model.layers.0.self_attn.k_proj.weight must be a matrix")
+        keys = {name.removeprefix("model.") for name in state_dict}
+
+        def has_bias(module: str, projections: tuple[str, ...]) -> bool:
+            return any(
+                f"layers.{idx}.{module}.{proj}.bias" in keys
+                for idx in range(layers) for proj in projections
+            )
 
         kv_dim = int(k_w.shape[0]) if k_w is not None else hidden_size
         if num_attention_heads is None:
@@ -140,10 +151,14 @@ class D16QwenImportConfig(D16QwenConfig):
                 num_attention_heads = hidden_size // 64
             else:
                 num_attention_heads = max(1, hidden_size // max(kv_dim, 2))
+        if num_attention_heads <= 0 or hidden_size % num_attention_heads:
+            raise ValueError("num_attention_heads must be positive and divide hidden_size")
         head_dim = hidden_size // num_attention_heads
         num_key_value_heads = max(1, kv_dim // head_dim)
 
         lm_w = state_dict.get("lm_head.weight")
+        if lm_w is not None and not isinstance(lm_w, torch.Tensor):
+            raise ValueError("lm_head.weight must be a tensor")
         tie_word_embeddings = (lm_w is None) or bool(
             lm_w.shape == embed_w.shape and torch.equal(lm_w.cpu(), embed_w.cpu())
         )
@@ -158,8 +173,8 @@ class D16QwenImportConfig(D16QwenConfig):
             rms_norm_eps=rms_norm_eps,
             rope_theta=rope_theta,
             tie_word_embeddings=tie_word_embeddings,
-            attention_bias=q_b is not None,
-            mlp_bias=up_b is not None,
+            attention_bias=has_bias("self_attn", ("q_proj", "k_proj", "v_proj")),
+            mlp_bias=has_bias("mlp", ("up_proj", "gate_proj", "down_proj")),
             indiff_eps=indiff_eps,
             indiff_rel=indiff_rel,
             mlp_activation=mlp_activation,
@@ -503,48 +518,40 @@ def find_mlp_quartets(
 
 _PACK_ROW_TILE: int = 4096
 
-# Фундаментальные геометрические константы реконструкции 2-й координаты в клине [0°, 22.5°]:
-# - WEDGE_SAT_SLOPE = TAN_PI_8 / 4 : четверть биссектрисы клина (после билинейного умножения даёт середину клина TAN_PI_8 / 2)
-# - WEDGE_HALF_SAT  = (TAN_PI_8 ** 2) * INV_SQRT2 : радиус полунасыщения в единицах глобального RMS матрицы
-WEDGE_SAT_SLOPE: float = 0.25 * TAN_PI_8
-WEDGE_HALF_SAT: float = (TAN_PI_8 ** 2) * INV_SQRT2
-
-
 @torch.no_grad()
 def compute_d16_second_coord(
     w: torch.Tensor,
-    mode: str = "d16_sat_rope_gate",
+    mode: str = "d16_sat_det",
     *,
-    partner_w: Optional[torch.Tensor] = None,
+    c_sat: float = 0.205,
+    c_w0: float = 0.120,
 ) -> torch.Tensor:
-    """Compute the complementary D16 coordinate w2 = f(w1) via D16 radial wedge saturation."""
-    if mode == "zero" or w.ndim < 2:
+    """Compute the complementary D16 coordinate w2 = f(w1) via D16 radial saturation."""
+    if mode == "zero":
         return torch.zeros_like(w)
 
     wf = w.detach().to(torch.float32)
     sigma_w = wf.square().mean().sqrt().clamp_min(1e-8)
-    y_sat = WEDGE_SAT_SLOPE * sigma_w
-    w0 = WEDGE_HALF_SAT * sigma_w
+    y_sat = c_sat * sigma_w
+    w0 = c_w0 * sigma_w
     envelope = y_sat * (wf.abs() / (w0 + wf.abs()))
 
     if mode == "d16_sat_rand":
         xi = torch.randn_like(wf)
     elif mode == "d16_sat_det":
-        dw = torch.roll(wf, -1, dims=-1) - torch.roll(wf, 1, dims=-1) if wf.shape[-1] >= 3 else wf.clone()
-        dw_std = dw.square().mean().sqrt().clamp_min(1e-8)
-        idx_r = torch.arange(wf.shape[-2], device=wf.device).unsqueeze(-1)
-        idx_c = torch.arange(wf.shape[-1], device=wf.device)
-        parity = torch.where(((idx_r + idx_c) & 1) == 0, 1.0, -1.0)
-        xi = ((dw / dw_std) * parity).clamp(-3.0, 3.0)
-    elif mode == "d16_sat_rope_gate":
-        if partner_w is not None and partner_w.shape == wf.shape:
-            pw = partner_w.detach().to(device=wf.device, dtype=torch.float32)
-            pw_std = pw.square().mean().sqrt().clamp_min(1e-8)
+        if wf.shape[-1] >= 3:
+            dw = torch.roll(wf, -1, dims=-1) - torch.roll(wf, 1, dims=-1)
         else:
-            w_pairs = wf.view(*wf.shape[:-1], wf.shape[-1] // 2, 2)
-            pw = torch.stack([-w_pairs[..., 1], w_pairs[..., 0]], dim=-1).reshape_as(wf)
-            pw_std = sigma_w
-        xi = (pw / pw_std).clamp(-3.0, 3.0)
+            dw = wf.clone()
+        dw_std = dw.square().mean().sqrt().clamp_min(1e-8)
+        # Шахматная чётность (-1)^(i+j) гарантирует идеальную симметрию S0=S15 и S7=S8
+        idx_last = torch.arange(wf.shape[-1], device=wf.device)
+        if wf.ndim >= 2:
+            idx_prev = torch.arange(wf.shape[-2], device=wf.device).unsqueeze(-1)
+            parity = torch.where(((idx_prev + idx_last) & 1) == 0, 1.0, -1.0)
+        else:
+            parity = torch.where((idx_last & 1) == 0, 1.0, -1.0)
+        xi = (dw / dw_std) * parity
     else:
         raise ValueError(f"Unknown second_coord_mode: {mode!r}")
 
@@ -560,14 +567,17 @@ def _compute_w2_slice(
     partner_slice: Optional[torch.Tensor] = None,
     sigma_partner: Optional[torch.Tensor] = None,
     row_offset: int = 0,
+    c_sat: float = 0.090,
+    c_w0: float = 0.120,
+    sign: float = 1.0,
 ) -> torch.Tensor:
     """Compute 2nd coordinate w2 for a row slice using global matrix statistics (sigma_w, sigma_partner)."""
-    if mode == "zero" or w_slice.ndim < 2:
+    if mode == "zero" or c_sat == 0.0 or w_slice.ndim < 2:
         return torch.zeros_like(w_slice)
 
     wf = w_slice.to(torch.float32)
-    y_sat = WEDGE_SAT_SLOPE * sigma_w
-    w0 = WEDGE_HALF_SAT * sigma_w
+    y_sat = c_sat * sigma_w
+    w0 = c_w0 * sigma_w
     envelope = y_sat * (wf.abs() / (w0 + wf.abs()))
 
     if mode == "d16_sat_rand":
@@ -578,7 +588,7 @@ def _compute_w2_slice(
         idx_r = torch.arange(row_offset, row_offset + wf.shape[-2], device=wf.device).unsqueeze(-1)
         idx_c = torch.arange(wf.shape[-1], device=wf.device)
         parity = torch.where(((idx_r + idx_c) & 1) == 0, 1.0, -1.0)
-        xi = ((dw / dw_std) * parity).clamp(-3.0, 3.0)
+        xi = (sign * (dw / dw_std) * parity).clamp(-3.0, 3.0)
     elif mode == "d16_sat_rope_gate":
         if partner_slice is not None and partner_slice.shape == wf.shape:
             pw = partner_slice.to(device=wf.device, dtype=torch.float32)
@@ -587,7 +597,7 @@ def _compute_w2_slice(
             w_pairs = wf.view(*wf.shape[:-1], wf.shape[-1] // 2, 2)
             pw = torch.stack([-w_pairs[..., 1], w_pairs[..., 0]], dim=-1).reshape_as(wf)
             pw_std = sigma_w.clamp_min(1e-8)
-        xi = (pw / pw_std).clamp(-3.0, 3.0)
+        xi = (sign * (pw / pw_std)).clamp(-3.0, 3.0)
     else:
         raise ValueError(f"Unknown second_coord_mode: {mode!r}")
 
@@ -600,10 +610,12 @@ def _compute_global_sigmas_tiled(
     mode: str,
     partner_w: Optional[torch.Tensor] = None,
     *,
+    dtype: torch.dtype,
+    c_sat: float = 0.090,
     row_tile: int = _PACK_ROW_TILE,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute global RMS statistics (sigma_w, sigma_partner) in row tiles without full-matrix allocation."""
-    if mode == "zero" or w.ndim < 2:
+    """Accumulate global RMS in tiles after rounding each input to the destination dtype."""
+    if mode == "zero" or c_sat == 0.0 or w.ndim < 2:
         one = torch.ones((), dtype=torch.float32, device=w.device)
         return one, one
 
@@ -613,13 +625,13 @@ def _compute_global_sigmas_tiled(
 
     for start in range(0, n_rows, row_tile):
         end = min(start + row_tile, n_rows)
-        sl = w[start:end].to(torch.float32)
+        sl = w[start:end].to(dtype).float()
         sq_w += sl.square().sum(dtype=torch.float64)
         if mode == "d16_sat_det" and sl.shape[-1] >= 3:
             dw = torch.roll(sl, -1, dims=-1) - torch.roll(sl, 1, dims=-1)
             sq_p += dw.square().sum(dtype=torch.float64)
         elif mode == "d16_sat_rope_gate" and partner_w is not None:
-            psl = partner_w[start:end].to(device=w.device, dtype=torch.float32)
+            psl = partner_w[start:end].to(device=w.device, dtype=dtype).float()
             sq_p += psl.square().sum(dtype=torch.float64)
 
     numel = max(w.numel(), 1)
@@ -638,62 +650,60 @@ def pack_weights_1to1(
     is_im_mask: Optional[torch.Tensor] = None,
     *,
     im_dim: int = 0,
-    second_coord_mode: str = "d16_sat_rope_gate",
+    second_coord_mode: str = "zero",
     partner_weight: Optional[torch.Tensor] = None,
+    c_sat: float = 0.090,
+    c_w0: float = 0.120,
+    sign: float = 1.0,
     row_tile: int = _PACK_ROW_TILE,
+    out: Optional[D16ComplexTensor] = None,
 ) -> D16ComplexTensor:
-    """Convert a real weight tensor 1-to-1 into a `D16ComplexTensor` in memory-bounded row tiles."""
+    """Pack row tiles directly into out, using its dtype and device for the imported weights."""
     w = weight.detach()
-    has_im = is_im_mask is not None and bool(is_im_mask.any())
-    mask_full = is_im_mask.to(device=w.device, dtype=torch.bool) if has_im else None
+    if row_tile <= 0:
+        raise ValueError("row_tile must be positive")
+    if out is None:
+        out = D16ComplexTensor.zeros(w.shape, dtype=w.dtype, device=w.device)
+    elif out.shape != w.shape:
+        raise ValueError(f"Source shape {tuple(w.shape)} does not match destination {tuple(out.shape)}")
+    if second_coord_mode != "d16_sat_rope_gate":
+        partner_weight = None
+    elif partner_weight is not None and partner_weight.shape != w.shape:
+        raise ValueError("partner_weight must have the same shape as weight")
 
     sigma_w, sigma_partner = _compute_global_sigmas_tiled(
-        w,
-        second_coord_mode,
-        partner_weight,
-        row_tile=row_tile,
+        w, second_coord_mode, partner_weight, dtype=out.dtype, c_sat=c_sat, row_tile=row_tile,
     )
+    sigma_w, sigma_partner = sigma_w.to(out.device), sigma_partner.to(out.device)
+    mask = None
+    if is_im_mask is not None and bool(is_im_mask.any()):
+        mask = is_im_mask.to(device=out.device, dtype=torch.bool)
+        if w.ndim == 2 and mask.ndim == 1:
+            mask = mask.unsqueeze(1 if im_dim == 0 else 0)
+        mask = mask.expand(w.shape)
 
-    if w.ndim < 2 or w.shape[0] <= row_tile:
-        w2 = _compute_w2_slice(
-            w,
-            second_coord_mode,
-            sigma_w=sigma_w,
-            partner_slice=partner_weight,
-            sigma_partner=sigma_partner,
-            row_offset=0,
-        )
-        if not has_im or mask_full is None:
-            return D16ComplexTensor.pack(w, w2)
-        m = (mask_full.unsqueeze(1) if im_dim == 0 else mask_full.unsqueeze(0)) if (w.ndim == 2 and mask_full.ndim == 1) else mask_full
-        return D16ComplexTensor.pack(torch.where(m, w2, w), torch.where(m, w, w2))
-
-    out = D16ComplexTensor.zeros(tuple(w.shape), dtype=w.dtype, device=w.device)
-    n_rows = w.shape[0]
+    n_rows = w.shape[0] if w.ndim else 1
     for start in range(0, n_rows, row_tile):
-        end = min(start + row_tile, n_rows)
-        w_sl = w[start:end]
-        p_sl = partner_weight[start:end] if partner_weight is not None else None
+        rows = slice(start, min(start + row_tile, n_rows)) if w.ndim else Ellipsis
+        w_sl = w[rows].to(device=out.device, dtype=out.dtype)
+        p_sl = None if partner_weight is None else partner_weight[rows].to(device=out.device, dtype=out.dtype)
         w2_sl = _compute_w2_slice(
             w_sl,
             second_coord_mode,
             sigma_w=sigma_w,
             partner_slice=p_sl,
             sigma_partner=sigma_partner,
-            row_offset=start,
+            row_offset=start if w.ndim == 2 else 0,
+            c_sat=c_sat,
+            c_w0=c_w0,
+            sign=sign,
         )
-        if not has_im or mask_full is None:
+        if mask is None:
             packed_sl = D16ComplexTensor.pack(w_sl, w2_sl)
         else:
-            if w.ndim == 2 and mask_full.ndim == 1:
-                m_sl = mask_full[start:end].unsqueeze(1) if im_dim == 0 else mask_full.unsqueeze(0)
-            else:
-                m_sl = mask_full[start:end]
+            m_sl = mask[rows]
             packed_sl = D16ComplexTensor.pack(torch.where(m_sl, w2_sl, w_sl), torch.where(m_sl, w_sl, w2_sl))
-
-        out.x[start:end].copy_(packed_sl.x)
-        out.y[start:end].copy_(packed_sl.y)
-        out.rotation[start:end].copy_(packed_sl.rotation)
+        out.copy_slice_(rows, packed_sl)
 
     return out
 
@@ -747,38 +757,48 @@ def _require_tensor(
 
 
 def _validate_qwen_state_dict(state_dict: Mapping[str, torch.Tensor], config: D16QwenConfig) -> None:
-    """Verify that all required tensors for `config` exist in `state_dict` before importing."""
-    missing: List[str] = []
-    if _get_tensor(state_dict, "model.embed_tokens.weight", "embed_tokens.weight") is None:
-        missing.append("model.embed_tokens.weight")
-    if _get_tensor(state_dict, "model.norm.weight", "norm.weight") is None:
-        missing.append("model.norm.weight")
-    if not config.tie_word_embeddings and _get_tensor(state_dict, "lm_head.weight") is None:
-        missing.append("lm_head.weight")
+    """Check the complete shapes and bias layout of the requested layers before allocating the model."""
+    errors: list[str] = []
+
+    def check(name: str, shape: Optional[tuple[int, ...]], *, required: bool = True) -> None:
+        tensor = _get_tensor(state_dict, name, name.removeprefix("model."))
+        if tensor is None:
+            if required and shape is not None:
+                errors.append(f"missing {name}")
+        elif shape is None:
+            errors.append(f"unexpected {name} for this bias configuration")
+        elif not isinstance(tensor, torch.Tensor):
+            errors.append(f"{name} must be a tensor")
+        elif tensor.shape != shape:
+            errors.append(f"{name}: expected {shape}, got {tuple(tensor.shape)}")
+
+    hidden = config.complex_hidden_size
+    intermediate = config.intermediate_size
+    if config.num_attention_heads <= 0:
+        raise ValueError("num_attention_heads must be positive")
+    kv_width = config.head_dim * config.num_key_value_heads
+    embedding_shape = (config.vocab_size, hidden)
+    check("model.embed_tokens.weight", embedding_shape)
+    check("model.norm.weight", (hidden,))
+    check("lm_head.weight", embedding_shape, required=not config.tie_word_embeddings)
 
     for idx in range(config.num_hidden_layers):
-        p_m, p_s = f"model.layers.{idx}", f"layers.{idx}"
-        for ln in ("input_layernorm.weight", "post_attention_layernorm.weight"):
-            if _get_tensor(state_dict, f"{p_m}.{ln}", f"{p_s}.{ln}") is None:
-                missing.append(f"{p_m}.{ln}")
-        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            if _get_tensor(state_dict, f"{p_m}.self_attn.{proj}.weight", f"{p_s}.self_attn.{proj}.weight") is None:
-                missing.append(f"{p_m}.self_attn.{proj}.weight")
-            if config.attention_bias and proj in ("q_proj", "k_proj", "v_proj"):
-                if _get_tensor(state_dict, f"{p_m}.self_attn.{proj}.bias", f"{p_s}.self_attn.{proj}.bias") is None:
-                    missing.append(f"{p_m}.self_attn.{proj}.bias")
-        mlp_projs = ("up_proj", "gate_proj", "down_proj") if config.mlp_activation == "bilinear" else ("up_proj", "down_proj")
-        for mproj in mlp_projs:
-            if _get_tensor(state_dict, f"{p_m}.mlp.{mproj}.weight", f"{p_s}.mlp.{mproj}.weight") is None:
-                missing.append(f"{p_m}.mlp.{mproj}.weight")
-            if config.mlp_bias:
-                if _get_tensor(state_dict, f"{p_m}.mlp.{mproj}.bias", f"{p_s}.mlp.{mproj}.bias") is None:
-                    missing.append(f"{p_m}.mlp.{mproj}.bias")
+        prefix = f"model.layers.{idx}"
+        for norm in ("input_layernorm", "post_attention_layernorm"):
+            check(f"{prefix}.{norm}.weight", (hidden,))
+        for proj, width in (("q_proj", hidden), ("k_proj", kv_width), ("v_proj", kv_width), ("o_proj", hidden)):
+            name = f"{prefix}.self_attn.{proj}"
+            check(f"{name}.weight", (width, hidden))
+            check(f"{name}.bias", (width,) if config.attention_bias and proj != "o_proj" else None)
+        for proj in ("up_proj", "gate_proj", "down_proj"):
+            name = f"{prefix}.mlp.{proj}"
+            required = proj != "gate_proj" or config.mlp_activation in ("bilinear", "gate")
+            shape = (hidden, intermediate) if proj == "down_proj" else (intermediate, hidden)
+            check(f"{name}.weight", shape, required=required)
+            check(f"{name}.bias", (shape[0],) if config.mlp_bias else None, required=required)
 
-    if missing:
-        raise ValueError(
-            f"Incomplete Qwen checkpoint: missing {len(missing)} required tensor(s): {missing[:10]}"
-        )
+    if errors:
+        raise ValueError("Invalid Qwen checkpoint: " + "; ".join(errors))
 
 
 @torch.no_grad()
@@ -791,12 +811,15 @@ def import_qwen_weights(
     indiff_eps: IndiffThreshold = 0.0,
     indiff_rel: float = 0.25,
     mlp_activation: MLPActivation = "bilinear",
-    second_coord_mode: str = "d16_sat_rope_gate",
+    second_coord_mode: str = "zero",
+    c_sat: float = 0.090,
+    c_w0: float = 0.120,
     dtype: Optional[torch.dtype] = None,
     device: Optional[Union[str, torch.device]] = None,
     verbose: bool = True,
 ) -> Tuple[D16QwenForCausalLM, ConversionReport]:
     """Import weights 1-to-1 from a Qwen file/folder/model/state_dict into `d16_qwen_model2.D16QwenForCausalLM`."""
+    # Load raw checkpoint onto CPU first to avoid doubling GPU VRAM during import:
     state_dict, cfg_dict = load_qwen_checkpoint(source, device="cpu")
 
     if config is None:
@@ -817,11 +840,12 @@ def import_qwen_weights(
                 mlp_activation=mlp_activation,
             )
 
+    # Validate checkpoint completeness BEFORE allocating or populating the D16 model:
     _validate_qwen_state_dict(state_dict, config)
 
-    sample_t = next(iter(state_dict.values()))
-    target_dtype = sample_t.dtype if dtype is None else dtype
-    target_device = sample_t.device if device is None else torch.device(device)
+    emb_w = _require_tensor(state_dict, "model.embed_tokens.weight", "embed_tokens.weight")
+    target_dtype = emb_w.dtype if dtype is None else dtype
+    target_device = emb_w.device if device is None else torch.device(device)
 
     with _fast_empty_d16_init(dtype=target_dtype, device=target_device):
         d16_model = D16QwenForCausalLM(config)
@@ -837,46 +861,13 @@ def import_qwen_weights(
         *,
         mode: str = "zero",
         partner_w: Optional[torch.Tensor] = None,
+        sign: float = 1.0,
     ) -> None:
         n_el = w.numel()
-        if w.ndim >= 2 and w.shape[0] > _PACK_ROW_TILE:
-            has_im = is_im_mask is not None and bool(is_im_mask.any())
-            mask_full = is_im_mask.to(device=target_device, dtype=torch.bool) if has_im else None
-            sigma_w, sigma_p = _compute_global_sigmas_tiled(
-                w, mode, partner_w, row_tile=_PACK_ROW_TILE
-            )
-            sigma_w = sigma_w.to(target_device)
-            sigma_p = sigma_p.to(target_device)
-
-            for start in range(0, w.shape[0], _PACK_ROW_TILE):
-                end = min(start + _PACK_ROW_TILE, w.shape[0])
-                w_sl = w[start:end].to(device=target_device, dtype=target_dtype)
-                p_sl = partner_w[start:end].to(device=target_device, dtype=target_dtype) if partner_w is not None else None
-                w2_sl = _compute_w2_slice(
-                    w_sl,
-                    mode,
-                    sigma_w=sigma_w,
-                    partner_slice=p_sl,
-                    sigma_partner=sigma_p,
-                    row_offset=start,
-                )
-                if not has_im or mask_full is None:
-                    packed_sl = D16ComplexTensor.pack(w_sl, w2_sl)
-                else:
-                    m_sl = mask_full[start:end].unsqueeze(1) if im_dim == 0 else mask_full.unsqueeze(0)
-                    packed_sl = D16ComplexTensor.pack(torch.where(m_sl, w2_sl, w_sl), torch.where(m_sl, w_sl, w2_sl))
-                param.copy_(packed_sl, index=slice(start, end))
-        else:
-            target_w = w.to(device=target_device, dtype=target_dtype)
-            target_p = partner_w.to(device=target_device, dtype=target_dtype) if partner_w is not None else None
-            d16_val = pack_weights_1to1(
-                target_w,
-                is_im_mask=is_im_mask,
-                im_dim=im_dim,
-                second_coord_mode=mode,
-                partner_weight=target_p,
-            )
-            param.copy_(d16_val)
+        pack_weights_1to1(
+            w, is_im_mask, im_dim=im_dim, second_coord_mode=mode, partner_weight=partner_w,
+            c_sat=c_sat, c_w0=c_w0, sign=sign, row_tile=_PACK_ROW_TILE, out=param.value(),
+        )
 
         report.total_imported_tensors += 1
         report.total_weights += n_el
@@ -890,16 +881,15 @@ def import_qwen_weights(
         report.total_im_weights += im_cnt
         report.total_re_weights += n_el - im_cnt
 
-    # 1. Embeddings, Final Norm, LM Head
-    emb_w = _require_tensor(state_dict, "model.embed_tokens.weight", "embed_tokens.weight")
-    _load_param(d16_model.model.embed_tokens.weight, emb_w, mode=second_coord_mode)
+    # 1. Embeddings (kept on the reference 0° axis), Final Norm, LM Head
+    _load_param(d16_model.model.embed_tokens.weight, emb_w, mode="zero")
 
     norm_w = _require_tensor(state_dict, "model.norm.weight", "norm.weight")
     _load_param(d16_model.model.norm.gain, norm_w, mode="zero")
 
     if not config.tie_word_embeddings:
         lm_w = _require_tensor(state_dict, "lm_head.weight")
-        _load_param(d16_model.lm_head.weight, lm_w, mode=second_coord_mode)
+        _load_param(d16_model.lm_head.weight, lm_w, mode="zero")
 
     # 2. Decoder Layers
     for idx, layer in enumerate(d16_model.model.layers):
@@ -915,11 +905,10 @@ def import_qwen_weights(
         for proj_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
             proj_mod = getattr(layer.self_attn, proj_name)
             pw = _require_tensor(state_dict, f"{p_m}.self_attn.{proj_name}.weight", f"{p_s}.self_attn.{proj_name}.weight")
-            _load_param(proj_mod.weight, pw, mode=second_coord_mode)
+            _load_param(proj_mod.weight, pw, mode=second_coord_mode, sign=1.0)
             if proj_mod.bias is not None:
-                pb = _get_tensor(state_dict, f"{p_m}.self_attn.{proj_name}.bias", f"{p_s}.self_attn.{proj_name}.bias")
-                if pb is not None:
-                    _load_param(proj_mod.bias, pb, mode="zero")
+                pb = _require_tensor(state_dict, f"{p_m}.self_attn.{proj_name}.bias", f"{p_s}.self_attn.{proj_name}.bias")
+                _load_param(proj_mod.bias, pb, mode="zero")
 
         up_w = _require_tensor(state_dict, f"{p_m}.mlp.up_proj.weight", f"{p_s}.mlp.up_proj.weight")
         gate_w = _get_tensor(state_dict, f"{p_m}.mlp.gate_proj.weight", f"{p_s}.mlp.gate_proj.weight")
@@ -935,19 +924,19 @@ def import_qwen_weights(
         report.layer_reports[idx] = layer_rep
         im_mask = layer_rep.is_im_neuron
 
-        _load_param(layer.mlp.up_proj.weight, up_w, is_im_mask=im_mask, im_dim=0, mode=second_coord_mode, partner_w=gate_w)
+        _load_param(layer.mlp.up_proj.weight, up_w, is_im_mask=im_mask, im_dim=0, mode=second_coord_mode, partner_w=gate_w, sign=1.0)
         if layer.mlp.up_proj.bias is not None:
             up_b = _require_tensor(state_dict, f"{p_m}.mlp.up_proj.bias", f"{p_s}.mlp.up_proj.bias")
             _load_param(layer.mlp.up_proj.bias, up_b, is_im_mask=im_mask, im_dim=0, mode="zero")
 
         if layer.mlp.gate_proj is not None:
             gate_req = _require_tensor(state_dict, f"{p_m}.mlp.gate_proj.weight", f"{p_s}.mlp.gate_proj.weight")
-            _load_param(layer.mlp.gate_proj.weight, gate_req, is_im_mask=im_mask, im_dim=0, mode=second_coord_mode, partner_w=up_w)
+            _load_param(layer.mlp.gate_proj.weight, gate_req, is_im_mask=im_mask, im_dim=0, mode=second_coord_mode, partner_w=up_w, sign=-1.0)
             if layer.mlp.gate_proj.bias is not None:
                 gate_b = _require_tensor(state_dict, f"{p_m}.mlp.gate_proj.bias", f"{p_s}.mlp.gate_proj.bias")
                 _load_param(layer.mlp.gate_proj.bias, gate_b, is_im_mask=im_mask, im_dim=0, mode="zero")
 
-        _load_param(layer.mlp.down_proj.weight, down_w, is_im_mask=im_mask, im_dim=1, mode=second_coord_mode)
+        _load_param(layer.mlp.down_proj.weight, down_w, is_im_mask=im_mask, im_dim=1, mode=second_coord_mode, sign=1.0)
         if layer.mlp.down_proj.bias is not None:
             down_b = _require_tensor(state_dict, f"{p_m}.mlp.down_proj.bias", f"{p_s}.mlp.down_proj.bias")
             _load_param(layer.mlp.down_proj.bias, down_b, mode="zero")

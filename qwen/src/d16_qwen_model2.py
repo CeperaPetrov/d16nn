@@ -413,12 +413,17 @@ class D16QwenModel(nn.Module):
 
 @dataclass
 class D16CausalLMOutput:
-    """Model results in D16. Backpropagate a defined loss through loss.x."""
+    """Backpropagate through loss.x. Optional sampling NLL and perplexity are scalar metrics."""
 
     logits: D16ComplexTensor
     hidden_states: D16ComplexTensor
     past_key_values: Optional[list[D16KeyValue]] = None
     loss: Optional[D16ComplexTensor] = None
+    nll: Optional[torch.Tensor] = None
+
+    @property
+    def perplexity(self) -> Optional[torch.Tensor]:
+        return None if self.nll is None else self.nll.exp()
 
 
 class D16QwenForCausalLM(nn.Module):
@@ -456,7 +461,12 @@ class D16QwenForCausalLM(nn.Module):
         past_key_values: Optional[list[D16KeyValue]] = None,
         labels: Optional[D16ComplexTensor] = None,
         use_cache: bool = False,
+        *,
+        sampling_temperature: Optional[float] = None,
     ) -> D16CausalLMOutput:
+        """With labels and a sampling temperature, also evaluate NLL at that temperature."""
+        if sampling_temperature is not None and labels is None:
+            raise ValueError("Sampling NLL requires labels")
         hidden_states, present = self.model(
             input_ids,
             attention_mask=attention_mask,
@@ -469,9 +479,11 @@ class D16QwenForCausalLM(nn.Module):
             targets = _token_addresses(labels, self.model.embed_tokens.token_keys(), allow_ignore=True)
             if targets.shape != input_ids.shape:
                 raise ValueError("Labels must have the same shape as the input token IDs")
-            output.loss = output.logits[..., :-1, :].wedge_cross_entropy(
-                targets[..., 1:], eps=self.config.indiff_eps, rel=self.config.indiff_rel
-            )
+            logits, targets = output.logits[..., :-1, :], targets[..., 1:]
+            eps, rel = self.config.indiff_eps, self.config.indiff_rel
+            output.loss = logits.wedge_cross_entropy(targets, eps=eps, rel=rel)
+            if sampling_temperature is not None:
+                output.nll = logits.sampling_nll(targets, sampling_temperature, eps=eps, rel=rel)
         return output
 
     @torch.no_grad()
@@ -499,9 +511,8 @@ class D16QwenForCausalLM(nn.Module):
                 hidden_states, past = self.model(inputs, past_key_values=past, use_cache=use_cache)
                 logits = self.lm_head(hidden_states[:, -1])
                 if do_sample:
-                    scaled_logits = logits.to(torch.float32) * (1.0 / max(temperature, 1e-5))
-                    probabilities = scaled_logits.wedge_softmax(
-                        eps=self.config.indiff_eps, rel=self.config.indiff_rel
+                    probabilities = logits.sampling_probabilities(
+                        temperature, eps=self.config.indiff_eps, rel=self.config.indiff_rel
                     )
                     addresses = torch.multinomial(probabilities.x, num_samples=1)
                 else:

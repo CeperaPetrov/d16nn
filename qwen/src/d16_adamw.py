@@ -222,15 +222,11 @@ class D16AdamW:
             names = ("first_x", "first_y", "first_rotation", "second_radius")
             if entry["step"] < 0 or any(entry[name].shape != parameter.x.shape for name in names):
                 raise ValueError("D16AdamW moment state has an invalid step or shape")
-            if entry["first_rotation"].dtype != parameter.rotation.dtype:
-                raise ValueError("D16AdamW sector mask dtype does not match the parameter")
             device, dtype = parameter.x.device, _accumulation_dtype(parameter.x)
-            first_x, first_y, second_r = (
-                entry[name].to(device=device, dtype=dtype, copy=True)
-                for name in ("first_x", "first_y", "second_radius")
-            )
-            rotation = entry["first_rotation"].to(device=device, copy=True)
-            first = D16ComplexTensor(first_x, first_y, rotation)
+            first = D16ComplexTensor(
+                entry["first_x"], entry["first_y"], entry["first_rotation"]
+            ).storage_copy(device=device, dtype=dtype)
+            second_r = entry["second_radius"].to(device=device, dtype=dtype)
             second = D16ComplexTensor.from_real(second_r).clone()
             restored.append(_Moments(entry["step"], first, second))
         self._set_options(
