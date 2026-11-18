@@ -498,8 +498,10 @@ def find_mlp_quartets(
 
 
 # =====================================================================
-# 5. STANDARD 1-TO-1 WEIGHT PACKING & MODEL IMPORT
+# 5. STANDARD 1-TO-1 WEIGHT PACKING & MODEL IMPORT (TILED & VALIDATED)
 # =====================================================================
+
+_PACK_ROW_TILE: int = 4096
 
 @torch.no_grad()
 def compute_d16_second_coord(
@@ -542,25 +544,136 @@ def compute_d16_second_coord(
 
 
 @torch.no_grad()
+def _compute_w2_slice(
+    w_slice: torch.Tensor,
+    mode: str,
+    *,
+    sigma_w: torch.Tensor,
+    partner_slice: Optional[torch.Tensor] = None,
+    sigma_partner: Optional[torch.Tensor] = None,
+    row_offset: int = 0,
+    c_sat: float = 0.090,
+    c_w0: float = 0.120,
+    sign: float = 1.0,
+) -> torch.Tensor:
+    """Compute 2nd coordinate w2 for a row slice using global matrix statistics (sigma_w, sigma_partner)."""
+    if mode == "zero" or c_sat == 0.0 or w_slice.ndim < 2:
+        return torch.zeros_like(w_slice)
+
+    wf = w_slice.to(torch.float32)
+    y_sat = c_sat * sigma_w
+    w0 = c_w0 * sigma_w
+    envelope = y_sat * (wf.abs() / (w0 + wf.abs()))
+
+    if mode == "d16_sat_rand":
+        xi = torch.randn_like(wf)
+    elif mode == "d16_sat_det":
+        dw = torch.roll(wf, -1, dims=-1) - torch.roll(wf, 1, dims=-1) if wf.shape[-1] >= 3 else wf
+        dw_std = (sigma_partner if sigma_partner is not None else dw.square().mean().sqrt()).clamp_min(1e-8)
+        idx_r = torch.arange(row_offset, row_offset + wf.shape[-2], device=wf.device).unsqueeze(-1)
+        idx_c = torch.arange(wf.shape[-1], device=wf.device)
+        parity = torch.where(((idx_r + idx_c) & 1) == 0, 1.0, -1.0)
+        xi = (sign * (dw / dw_std) * parity).clamp(-3.0, 3.0)
+    elif mode == "d16_sat_rope_gate":
+        if partner_slice is not None and partner_slice.shape == wf.shape:
+            pw = partner_slice.to(device=wf.device, dtype=torch.float32)
+            pw_std = (sigma_partner if sigma_partner is not None else pw.square().mean().sqrt()).clamp_min(1e-8)
+        else:
+            w_pairs = wf.view(*wf.shape[:-1], wf.shape[-1] // 2, 2)
+            pw = torch.stack([-w_pairs[..., 1], w_pairs[..., 0]], dim=-1).reshape_as(wf)
+            pw_std = sigma_w.clamp_min(1e-8)
+        xi = (sign * (pw / pw_std)).clamp(-3.0, 3.0)
+    else:
+        raise ValueError(f"Unknown second_coord_mode: {mode!r}")
+
+    return (envelope * xi).to(dtype=w_slice.dtype)
+
+
+@torch.no_grad()
 def pack_weights_1to1(
     weight: torch.Tensor,
     is_im_mask: Optional[torch.Tensor] = None,
     *,
     im_dim: int = 0,
-    second_coord_mode: str = "d16_sat_det",
+    second_coord_mode: str = "zero",
+    partner_weight: Optional[torch.Tensor] = None,
+    c_sat: float = 0.090,
+    c_w0: float = 0.120,
+    sign: float = 1.0,
+    row_tile: int = _PACK_ROW_TILE,
 ) -> D16ComplexTensor:
-    """Convert a real weight tensor 1-to-1 into a `D16ComplexTensor` with reconstructed 2nd coordinate."""
-    w1 = weight.detach()
-    w2 = compute_d16_second_coord(w1, mode=second_coord_mode)
-    if is_im_mask is None or not bool(is_im_mask.any()):
-        return D16ComplexTensor.pack(w1, w2)
+    """Convert a real weight tensor 1-to-1 into a `D16ComplexTensor` in memory-bounded row tiles."""
+    w = weight.detach()
+    has_im = is_im_mask is not None and bool(is_im_mask.any())
+    mask_full = is_im_mask.to(device=w.device, dtype=torch.bool) if has_im else None
 
-    mask = is_im_mask.to(device=w1.device, dtype=torch.bool)
-    if w1.ndim == 2 and mask.ndim == 1:
-        mask = mask.unsqueeze(1) if im_dim == 0 else mask.unsqueeze(0)
-    re = torch.where(mask, w2, w1)
-    im = torch.where(mask, w1, w2)
-    return D16ComplexTensor.pack(re, im)
+    # Compute global matrix RMS statistics once across the entire tensor so tiling never alters values:
+    if second_coord_mode != "zero" and w.ndim >= 2 and c_sat != 0.0:
+        wf_all = w.to(torch.float32)
+        sigma_w = wf_all.square().mean().sqrt().clamp_min(1e-8)
+        if second_coord_mode == "d16_sat_det" and wf_all.shape[-1] >= 3:
+            dw_all = torch.roll(wf_all, -1, dims=-1) - torch.roll(wf_all, 1, dims=-1)
+            sigma_partner: Optional[torch.Tensor] = dw_all.square().mean().sqrt().clamp_min(1e-8)
+            del dw_all
+        elif second_coord_mode == "d16_sat_rope_gate" and partner_weight is not None:
+            sigma_partner = partner_weight.detach().to(torch.float32).square().mean().sqrt().clamp_min(1e-8)
+        else:
+            sigma_partner = sigma_w
+        del wf_all
+    else:
+        sigma_w = torch.ones((), dtype=torch.float32, device=w.device)
+        sigma_partner = sigma_w
+
+    # 1D vectors or small 2D matrices fit in a single tile:
+    if w.ndim < 2 or w.shape[0] <= row_tile:
+        w2 = _compute_w2_slice(
+            w,
+            second_coord_mode,
+            sigma_w=sigma_w,
+            partner_slice=partner_weight,
+            sigma_partner=sigma_partner,
+            row_offset=0,
+            c_sat=c_sat,
+            c_w0=c_w0,
+            sign=sign,
+        )
+        if not has_im or mask_full is None:
+            return D16ComplexTensor.pack(w, w2)
+        m = (mask_full.unsqueeze(1) if im_dim == 0 else mask_full.unsqueeze(0)) if (w.ndim == 2 and mask_full.ndim == 1) else mask_full
+        return D16ComplexTensor.pack(torch.where(m, w2, w), torch.where(m, w, w2))
+
+    # Tiled packing along dim 0 (caps peak VRAM on 151936x896 embed_tokens from ~14 GiB to ~350 MiB):
+    out = D16ComplexTensor.zeros(tuple(w.shape), dtype=w.dtype, device=w.device)
+    n_rows = w.shape[0]
+    for start in range(0, n_rows, row_tile):
+        end = min(start + row_tile, n_rows)
+        w_sl = w[start:end]
+        p_sl = partner_weight[start:end] if partner_weight is not None else None
+        w2_sl = _compute_w2_slice(
+            w_sl,
+            second_coord_mode,
+            sigma_w=sigma_w,
+            partner_slice=p_sl,
+            sigma_partner=sigma_partner,
+            row_offset=start,
+            c_sat=c_sat,
+            c_w0=c_w0,
+            sign=sign,
+        )
+        if not has_im or mask_full is None:
+            packed_sl = D16ComplexTensor.pack(w_sl, w2_sl)
+        else:
+            if w.ndim == 2 and mask_full.ndim == 1:
+                m_sl = mask_full[start:end].unsqueeze(1) if im_dim == 0 else mask_full.unsqueeze(0)
+            else:
+                m_sl = mask_full[start:end]
+            packed_sl = D16ComplexTensor.pack(torch.where(m_sl, w2_sl, w_sl), torch.where(m_sl, w_sl, w2_sl))
+
+        out.x[start:end].copy_(packed_sl.x)
+        out.y[start:end].copy_(packed_sl.y)
+        out.rotation[start:end].copy_(packed_sl.rotation)
+
+    return out
 
 
 @contextmanager
@@ -602,6 +715,50 @@ def _get_tensor(
     return None
 
 
+def _require_tensor(
+    state_dict: Mapping[str, torch.Tensor], *keys: str
+) -> torch.Tensor:
+    t = _get_tensor(state_dict, *keys)
+    if t is None:
+        raise KeyError(f"Missing required Qwen checkpoint tensor (tried keys: {keys})")
+    return t
+
+
+def _validate_qwen_state_dict(state_dict: Mapping[str, torch.Tensor], config: D16QwenConfig) -> None:
+    """Verify that all required tensors for `config` exist in `state_dict` before importing."""
+    missing: List[str] = []
+    if _get_tensor(state_dict, "model.embed_tokens.weight", "embed_tokens.weight") is None:
+        missing.append("model.embed_tokens.weight")
+    if _get_tensor(state_dict, "model.norm.weight", "norm.weight") is None:
+        missing.append("model.norm.weight")
+    if not config.tie_word_embeddings and _get_tensor(state_dict, "lm_head.weight") is None:
+        missing.append("lm_head.weight")
+
+    for idx in range(config.num_hidden_layers):
+        p_m, p_s = f"model.layers.{idx}", f"layers.{idx}"
+        for ln in ("input_layernorm.weight", "post_attention_layernorm.weight"):
+            if _get_tensor(state_dict, f"{p_m}.{ln}", f"{p_s}.{ln}") is None:
+                missing.append(f"{p_m}.{ln}")
+        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            if _get_tensor(state_dict, f"{p_m}.self_attn.{proj}.weight", f"{p_s}.self_attn.{proj}.weight") is None:
+                missing.append(f"{p_m}.self_attn.{proj}.weight")
+            if config.attention_bias and proj in ("q_proj", "k_proj", "v_proj"):
+                if _get_tensor(state_dict, f"{p_m}.self_attn.{proj}.bias", f"{p_s}.self_attn.{proj}.bias") is None:
+                    missing.append(f"{p_m}.self_attn.{proj}.bias")
+        mlp_projs = ("up_proj", "gate_proj", "down_proj") if config.mlp_activation == "bilinear" else ("up_proj", "down_proj")
+        for mproj in mlp_projs:
+            if _get_tensor(state_dict, f"{p_m}.mlp.{mproj}.weight", f"{p_s}.mlp.{mproj}.weight") is None:
+                missing.append(f"{p_m}.mlp.{mproj}.weight")
+            if config.mlp_bias:
+                if _get_tensor(state_dict, f"{p_m}.mlp.{mproj}.bias", f"{p_s}.mlp.{mproj}.bias") is None:
+                    missing.append(f"{p_m}.mlp.{mproj}.bias")
+
+    if missing:
+        raise ValueError(
+            f"Incomplete Qwen checkpoint: missing {len(missing)} required tensor(s): {missing[:10]}"
+        )
+
+
 @torch.no_grad()
 def import_qwen_weights(
     source: Union[str, Path, nn.Module, Mapping[str, torch.Tensor]],
@@ -612,13 +769,16 @@ def import_qwen_weights(
     indiff_eps: IndiffThreshold = 0.0,
     indiff_rel: float = 0.25,
     mlp_activation: MLPActivation = "bilinear",
+    second_coord_mode: str = "zero",
+    c_sat: float = 0.090,
+    c_w0: float = 0.120,
     dtype: Optional[torch.dtype] = None,
     device: Optional[Union[str, torch.device]] = None,
     verbose: bool = True,
 ) -> Tuple[D16QwenForCausalLM, ConversionReport]:
     """Import weights 1-to-1 from a Qwen file/folder/model/state_dict into `d16_qwen_model2.D16QwenForCausalLM`."""
-    load_dev = "cpu" if device is None else device
-    state_dict, cfg_dict = load_qwen_checkpoint(source, device=load_dev)
+    # Load raw checkpoint onto CPU first to avoid doubling GPU VRAM during import:
+    state_dict, cfg_dict = load_qwen_checkpoint(source, device="cpu")
 
     if config is None:
         if cfg_dict is not None:
@@ -638,6 +798,9 @@ def import_qwen_weights(
                 mlp_activation=mlp_activation,
             )
 
+    # Validate checkpoint completeness BEFORE allocating or populating the D16 model:
+    _validate_qwen_state_dict(state_dict, config)
+
     sample_t = next(iter(state_dict.values()))
     target_dtype = sample_t.dtype if dtype is None else dtype
     target_device = sample_t.device if device is None else torch.device(device)
@@ -653,19 +816,73 @@ def import_qwen_weights(
         w: torch.Tensor,
         is_im_mask: Optional[torch.Tensor] = None,
         im_dim: int = 0,
+        *,
+        mode: str = "zero",
+        partner_w: Optional[torch.Tensor] = None,
+        sign: float = 1.0,
     ) -> None:
-        target_w = w.to(device=target_device, dtype=target_dtype)
-        d16_val = pack_weights_1to1(target_w, is_im_mask=is_im_mask, im_dim=im_dim)
-        param.copy_(d16_val)
+        n_el = w.numel()
+        # Stream-pack in row tiles so huge tensors (embed_tokens) never allocate full-matrix temporaries on GPU:
+        if w.ndim >= 2 and w.shape[0] > _PACK_ROW_TILE:
+            has_im = is_im_mask is not None and bool(is_im_mask.any())
+            mask_full = is_im_mask.to(device=target_device, dtype=torch.bool) if has_im else None
+            if mode != "zero" and c_sat != 0.0:
+                wf_all = w.to(torch.float32)
+                sigma_w = wf_all.square().mean().sqrt().clamp_min(1e-8).to(target_device)
+                if mode == "d16_sat_det" and wf_all.shape[-1] >= 3:
+                    dw_all = torch.roll(wf_all, -1, dims=-1) - torch.roll(wf_all, 1, dims=-1)
+                    sigma_p = dw_all.square().mean().sqrt().clamp_min(1e-8).to(target_device)
+                    del dw_all
+                elif mode == "d16_sat_rope_gate" and partner_w is not None:
+                    sigma_p = partner_w.to(torch.float32).square().mean().sqrt().clamp_min(1e-8).to(target_device)
+                else:
+                    sigma_p = sigma_w
+                del wf_all
+            else:
+                sigma_w = torch.ones((), dtype=torch.float32, device=target_device)
+                sigma_p = sigma_w
 
-        n_el = target_w.numel()
+            for start in range(0, w.shape[0], _PACK_ROW_TILE):
+                end = min(start + _PACK_ROW_TILE, w.shape[0])
+                w_sl = w[start:end].to(device=target_device, dtype=target_dtype)
+                p_sl = partner_w[start:end].to(device=target_device, dtype=target_dtype) if partner_w is not None else None
+                w2_sl = _compute_w2_slice(
+                    w_sl,
+                    mode,
+                    sigma_w=sigma_w,
+                    partner_slice=p_sl,
+                    sigma_partner=sigma_p,
+                    row_offset=start,
+                    c_sat=c_sat,
+                    c_w0=c_w0,
+                    sign=sign,
+                )
+                if not has_im or mask_full is None:
+                    packed_sl = D16ComplexTensor.pack(w_sl, w2_sl)
+                else:
+                    m_sl = mask_full[start:end].unsqueeze(1) if im_dim == 0 else mask_full.unsqueeze(0)
+                    packed_sl = D16ComplexTensor.pack(torch.where(m_sl, w2_sl, w_sl), torch.where(m_sl, w_sl, w2_sl))
+                param.copy_(packed_sl, index=slice(start, end))
+        else:
+            target_w = w.to(device=target_device, dtype=target_dtype)
+            target_p = partner_w.to(device=target_device, dtype=target_dtype) if partner_w is not None else None
+            d16_val = pack_weights_1to1(
+                target_w,
+                is_im_mask=is_im_mask,
+                im_dim=im_dim,
+                second_coord_mode=mode,
+                partner_weight=target_p,
+                c_sat=c_sat,
+                c_w0=c_w0,
+                sign=sign,
+            )
+            param.copy_(d16_val)
+
         report.total_imported_tensors += 1
         report.total_weights += n_el
         if is_im_mask is not None and bool(is_im_mask.any()):
-            if target_w.ndim == 2 and is_im_mask.ndim == 1:
-                im_cnt = int(is_im_mask.sum().item()) * (
-                    target_w.shape[1] if im_dim == 0 else target_w.shape[0]
-                )
+            if w.ndim == 2 and is_im_mask.ndim == 1:
+                im_cnt = int(is_im_mask.sum().item()) * (w.shape[1] if im_dim == 0 else w.shape[0])
             else:
                 im_cnt = int(is_im_mask.sum().item())
         else:
@@ -673,85 +890,75 @@ def import_qwen_weights(
         report.total_im_weights += im_cnt
         report.total_re_weights += n_el - im_cnt
 
-    # 1. Embeddings, Final Norm, LM Head
-    emb_w = _get_tensor(state_dict, "model.embed_tokens.weight", "embed_tokens.weight")
-    if emb_w is not None:
-        _load_param(d16_model.model.embed_tokens.weight, emb_w)
+    # 1. Embeddings (kept on the reference 0° axis), Final Norm, LM Head
+    emb_w = _require_tensor(state_dict, "model.embed_tokens.weight", "embed_tokens.weight")
+    _load_param(d16_model.model.embed_tokens.weight, emb_w, mode="zero")
 
-    norm_w = _get_tensor(state_dict, "model.norm.weight", "norm.weight")
-    if norm_w is not None:
-        _load_param(d16_model.model.norm.gain, norm_w)
+    norm_w = _require_tensor(state_dict, "model.norm.weight", "norm.weight")
+    _load_param(d16_model.model.norm.gain, norm_w, mode="zero")
 
     if not config.tie_word_embeddings:
-        lm_w = _get_tensor(state_dict, "lm_head.weight")
-        if lm_w is not None:
-            _load_param(d16_model.lm_head.weight, lm_w)
+        lm_w = _require_tensor(state_dict, "lm_head.weight")
+        _load_param(d16_model.lm_head.weight, lm_w, mode="zero")
 
     # 2. Decoder Layers
     for idx, layer in enumerate(d16_model.model.layers):
         p_m = f"model.layers.{idx}"
         p_s = f"layers.{idx}"
 
-        in_ln = _get_tensor(state_dict, f"{p_m}.input_layernorm.weight", f"{p_s}.input_layernorm.weight")
-        if in_ln is not None:
-            _load_param(layer.input_layernorm.gain, in_ln)
+        in_ln = _require_tensor(state_dict, f"{p_m}.input_layernorm.weight", f"{p_s}.input_layernorm.weight")
+        _load_param(layer.input_layernorm.gain, in_ln, mode="zero")
 
-        post_ln = _get_tensor(state_dict, f"{p_m}.post_attention_layernorm.weight", f"{p_s}.post_attention_layernorm.weight")
-        if post_ln is not None:
-            _load_param(layer.post_attention_layernorm.gain, post_ln)
+        post_ln = _require_tensor(state_dict, f"{p_m}.post_attention_layernorm.weight", f"{p_s}.post_attention_layernorm.weight")
+        _load_param(layer.post_attention_layernorm.gain, post_ln, mode="zero")
 
         for proj_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
             proj_mod = getattr(layer.self_attn, proj_name)
-            pw = _get_tensor(state_dict, f"{p_m}.self_attn.{proj_name}.weight", f"{p_s}.self_attn.{proj_name}.weight")
-            if pw is not None:
-                _load_param(proj_mod.weight, pw)
+            pw = _require_tensor(state_dict, f"{p_m}.self_attn.{proj_name}.weight", f"{p_s}.self_attn.{proj_name}.weight")
+            _load_param(proj_mod.weight, pw, mode=second_coord_mode, sign=1.0)
             if proj_mod.bias is not None:
                 pb = _get_tensor(state_dict, f"{p_m}.self_attn.{proj_name}.bias", f"{p_s}.self_attn.{proj_name}.bias")
                 if pb is not None:
-                    _load_param(proj_mod.bias, pb)
+                    _load_param(proj_mod.bias, pb, mode="zero")
 
-        up_w = _get_tensor(state_dict, f"{p_m}.mlp.up_proj.weight", f"{p_s}.mlp.up_proj.weight")
+        up_w = _require_tensor(state_dict, f"{p_m}.mlp.up_proj.weight", f"{p_s}.mlp.up_proj.weight")
         gate_w = _get_tensor(state_dict, f"{p_m}.mlp.gate_proj.weight", f"{p_s}.mlp.gate_proj.weight")
-        down_w = _get_tensor(state_dict, f"{p_m}.mlp.down_proj.weight", f"{p_s}.mlp.down_proj.weight")
+        down_w = _require_tensor(state_dict, f"{p_m}.mlp.down_proj.weight", f"{p_s}.mlp.down_proj.weight")
 
-        if up_w is not None:
-            layer_rep = find_mlp_quartets(
-                up_w,
-                gate_w,
-                down_w,
-                layer_idx=idx,
-                min_orbit_score=min_orbit_score,
+        layer_rep = find_mlp_quartets(
+            up_w,
+            gate_w,
+            down_w,
+            layer_idx=idx,
+            min_orbit_score=min_orbit_score,
+        )
+        report.layer_reports[idx] = layer_rep
+        im_mask = layer_rep.is_im_neuron
+
+        _load_param(layer.mlp.up_proj.weight, up_w, is_im_mask=im_mask, im_dim=0, mode=second_coord_mode, partner_w=gate_w, sign=1.0)
+        if layer.mlp.up_proj.bias is not None:
+            up_b = _require_tensor(state_dict, f"{p_m}.mlp.up_proj.bias", f"{p_s}.mlp.up_proj.bias")
+            _load_param(layer.mlp.up_proj.bias, up_b, is_im_mask=im_mask, im_dim=0, mode="zero")
+
+        if layer.mlp.gate_proj is not None:
+            gate_req = _require_tensor(state_dict, f"{p_m}.mlp.gate_proj.weight", f"{p_s}.mlp.gate_proj.weight")
+            _load_param(layer.mlp.gate_proj.weight, gate_req, is_im_mask=im_mask, im_dim=0, mode=second_coord_mode, partner_w=up_w, sign=-1.0)
+            if layer.mlp.gate_proj.bias is not None:
+                gate_b = _require_tensor(state_dict, f"{p_m}.mlp.gate_proj.bias", f"{p_s}.mlp.gate_proj.bias")
+                _load_param(layer.mlp.gate_proj.bias, gate_b, is_im_mask=im_mask, im_dim=0, mode="zero")
+
+        _load_param(layer.mlp.down_proj.weight, down_w, is_im_mask=im_mask, im_dim=1, mode=second_coord_mode, sign=1.0)
+        if layer.mlp.down_proj.bias is not None:
+            down_b = _require_tensor(state_dict, f"{p_m}.mlp.down_proj.bias", f"{p_s}.mlp.down_proj.bias")
+            _load_param(layer.mlp.down_proj.bias, down_b, mode="zero")
+
+        if verbose:
+            print(
+                f"[Слой {idx:2d}/{config.num_hidden_layers - 1:2d}] "
+                f"Четверок >= {min_orbit_score:.2f}: {layer_rep.active_quartets_count:4d}/{layer_rep.quadruplets.shape[0]:<4d} | "
+                f"Re: {layer_rep.re_neurons_count:4d}, Im: {layer_rep.im_neurons_count:4d} | "
+                f"Ср. Score: {layer_rep.mean_orbit_score:.4f}"
             )
-            report.layer_reports[idx] = layer_rep
-            im_mask = layer_rep.is_im_neuron
-
-            _load_param(layer.mlp.up_proj.weight, up_w, is_im_mask=im_mask, im_dim=0)
-            if layer.mlp.up_proj.bias is not None:
-                up_b = _get_tensor(state_dict, f"{p_m}.mlp.up_proj.bias", f"{p_s}.mlp.up_proj.bias")
-                if up_b is not None:
-                    _load_param(layer.mlp.up_proj.bias, up_b, is_im_mask=im_mask, im_dim=0)
-
-            if layer.mlp.gate_proj is not None and gate_w is not None:
-                _load_param(layer.mlp.gate_proj.weight, gate_w, is_im_mask=im_mask, im_dim=0)
-                if layer.mlp.gate_proj.bias is not None:
-                    gate_b = _get_tensor(state_dict, f"{p_m}.mlp.gate_proj.bias", f"{p_s}.mlp.gate_proj.bias")
-                    if gate_b is not None:
-                        _load_param(layer.mlp.gate_proj.bias, gate_b, is_im_mask=im_mask, im_dim=0)
-
-            if down_w is not None:
-                _load_param(layer.mlp.down_proj.weight, down_w, is_im_mask=im_mask, im_dim=1)
-                if layer.mlp.down_proj.bias is not None:
-                    down_b = _get_tensor(state_dict, f"{p_m}.mlp.down_proj.bias", f"{p_s}.mlp.down_proj.bias")
-                    if down_b is not None:
-                        _load_param(layer.mlp.down_proj.bias, down_b)
-
-            if verbose:
-                print(
-                    f"[Слой {idx:2d}/{config.num_hidden_layers - 1:2d}] "
-                    f"Четверок >= {min_orbit_score:.2f}: {layer_rep.active_quartets_count:4d}/{layer_rep.quadruplets.shape[0]:<4d} | "
-                    f"Re: {layer_rep.re_neurons_count:4d}, Im: {layer_rep.im_neurons_count:4d} | "
-                    f"Ср. Score: {layer_rep.mean_orbit_score:.4f}"
-                )
 
     return d16_model, report
 

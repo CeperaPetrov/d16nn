@@ -12,11 +12,17 @@ from d16_complex import D16ComplexTensor
 class D16Parameter(nn.Module):
     """Register the coordinates and mask of a canonical D16 value."""
 
-    def __init__(self, value: D16ComplexTensor) -> None:
+    def __init__(self, value: D16ComplexTensor, *, requires_grad: bool = True) -> None:
         super().__init__()
-        self.x = nn.Parameter(value.x.detach())
-        self.y = nn.Parameter(value.y.detach())
-        self.register_buffer("rotation", value.rotation.detach().to(torch.int32))
+        if not isinstance(value, D16ComplexTensor):
+            raise TypeError("D16Parameter expects a D16ComplexTensor value")
+        # Гарантируем собственное изменяемое contiguous-хранилище без shared memory / broadcast views:
+        x_buf = value.x.detach().clone().contiguous()
+        y_buf = value.y.detach().clone().contiguous()
+        rot_buf = value.rotation.detach().clone().contiguous()
+        self.x = nn.Parameter(x_buf, requires_grad=requires_grad)
+        self.y = nn.Parameter(y_buf, requires_grad=requires_grad)
+        self.register_buffer("rotation", rot_buf)
 
     @classmethod
     def zeros(cls, shape: tuple[int, ...]) -> "D16Parameter":

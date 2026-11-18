@@ -1584,11 +1584,14 @@ if _HAS_TORCH:
         ) -> "D16ComplexTensor":
             """Mean negative log-likelihood from rotation-free wedge signal strength (x, y)."""
             undefined = self.is_nan()
-            strength = self.wedge_strength(eps=eps, rel=rel)
             active = ~undefined
             valid = targets != -100
             addresses = targets.masked_fill(~valid, 0).unsqueeze(-1)
-            selected = strength.gather(-1, addresses).squeeze(-1)
+            target_mask = torch.zeros_like(active).scatter_(-1, addresses, valid.unsqueeze(-1))
+
+            # Сырой сигнал (без отсечки) сохраняет градиент даже для слабой цели ниже порога:
+            raw_strength = self.wedge_strength(eps=0.0, rel=0.0)
+            cut_strength = self.wedge_strength(eps=eps, rel=rel)
 
             has_cutoff = (
                 (isinstance(eps, str) and eps == "auto" and rel > 0.0)
@@ -1596,19 +1599,21 @@ if _HAS_TORCH:
                 or isinstance(eps, torch.Tensor)
             )
             if has_cutoff:
-                above_cutoff = active & (strength > 0.0)
+                above_cutoff = active & (cut_strength > 0.0)
                 has_survivor = above_cutoff.any(dim=-1, keepdim=True)
                 eff_active = torch.where(has_survivor, above_cutoff, active)
             else:
                 eff_active = active
 
-            target_mask = torch.zeros_like(eff_active).scatter_(-1, addresses, valid.unsqueeze(-1))
+            # Целевой токен всегда участвует со своим живым сигналом raw_strength и живым градиентом:
             eff_active = eff_active | (target_mask & active)
+            eff_strength = torch.where(target_mask, raw_strength, cut_strength)
+            selected = raw_strength.gather(-1, addresses).squeeze(-1)
 
-            masked_strength = torch.where(eff_active, strength, -float("inf"))
+            masked_strength = torch.where(eff_active, eff_strength, -float("inf"))
             max_val = masked_strength.amax(dim=-1, keepdim=True)
             max_val = torch.where(torch.isfinite(max_val), max_val, 0.0)
-            shifted = torch.where(eff_active, strength - max_val, -float("inf"))
+            shifted = torch.where(eff_active, eff_strength - max_val, -float("inf"))
             terms = shifted.exp()
             losses = (terms.sum(dim=-1).clamp_min(1e-12).log() + max_val.squeeze(-1)) - selected
             mean = (losses.masked_fill(~valid, 0.0).sum() / valid.sum()).masked_fill(
