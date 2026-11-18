@@ -48,7 +48,7 @@ class D16QwenImportConfig(D16QwenConfig):
     match the reference Qwen dimensions 1-to-1 without modifying `d16_qwen_model2.py`.
     """
 
-    mlp_activation: MLPActivation = "bilinear"
+    mlp_activation: MLPActivation = "gate"
 
     @property
     def complex_hidden_size(self) -> int:
@@ -66,7 +66,7 @@ class D16QwenImportConfig(D16QwenConfig):
         num_hidden_layers: Optional[int] = None,
         indiff_eps: IndiffThreshold = 0.0,
         indiff_rel: float = 0.25,
-        mlp_activation: MLPActivation = "bilinear",
+        mlp_activation: MLPActivation = "gate",
         collect_d16_stats: bool = False,
     ) -> "D16QwenImportConfig":
         """Build a 1-to-1 D16QwenImportConfig from a HuggingFace Qwen config dict or object."""
@@ -105,7 +105,7 @@ class D16QwenImportConfig(D16QwenConfig):
         rope_theta: float = 1000000.0,
         indiff_eps: IndiffThreshold = 0.0,
         indiff_rel: float = 0.25,
-        mlp_activation: MLPActivation = "bilinear",
+        mlp_activation: MLPActivation = "gate",
         collect_d16_stats: bool = False,
     ) -> "D16QwenImportConfig":
         """Infer 1-to-1 D16QwenImportConfig dimensions directly from a Qwen state_dict."""
@@ -577,6 +577,16 @@ def compute_d16_second_coord(
 
 
 @torch.no_grad()
+def _rope_head_half_partner(w: torch.Tensor, head_dim: int) -> Optional[torch.Tensor]:
+    """Pair each attention head's first half r in [0..head_dim//2) with its RoPE conjugate half r + head_dim//2."""
+    if head_dim <= 0 or (head_dim % 2) != 0 or w.ndim < 1 or (w.shape[0] % head_dim) != 0:
+        return None
+    half = head_dim // 2
+    w_heads = w.view(-1, 2, half, *w.shape[1:])
+    return torch.cat((w_heads[:, 1], -w_heads[:, 0]), dim=1).reshape_as(w)
+
+
+@torch.no_grad()
 def _compute_w2_slice(
     w_slice: torch.Tensor,
     mode: str,
@@ -590,7 +600,7 @@ def _compute_w2_slice(
     sign: float = 1.0,
 ) -> torch.Tensor:
     """Compute 2nd coordinate w2 for a row slice using global matrix statistics (sigma_w, sigma_partner)."""
-    if mode == "zero" or c_sat == 0.0 or w_slice.ndim < 2:
+    if mode == "zero" or c_sat == 0.0 or (w_slice.ndim < 2 and partner_slice is None):
         return torch.zeros_like(w_slice)
 
     wf = w_slice.to(torch.float32)
@@ -633,7 +643,7 @@ def _compute_global_sigmas_tiled(
     row_tile: int = _PACK_ROW_TILE,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Accumulate global RMS in tiles after rounding each input to the destination dtype."""
-    if mode == "zero" or c_sat == 0.0 or w.ndim < 2:
+    if mode == "zero" or c_sat == 0.0 or (w.ndim < 2 and partner_w is None):
         one = torch.ones((), dtype=torch.float32, device=w.device)
         return one, one
 
@@ -828,7 +838,7 @@ def import_qwen_weights(
     min_orbit_score: float = 0.25,
     indiff_eps: IndiffThreshold = 0.0,
     indiff_rel: float = 0.25,
-    mlp_activation: MLPActivation = "bilinear",
+    mlp_activation: MLPActivation = "gate",
     second_coord_mode: str = "zero",
     c_sat: float = WEDGE_SAT_SLOPE,
     c_w0: float = WEDGE_HALF_SAT,
@@ -868,6 +878,9 @@ def import_qwen_weights(
     with _fast_empty_d16_init(dtype=target_dtype, device=target_device):
         d16_model = D16QwenForCausalLM(config)
     d16_model = d16_model.to(device=target_device)
+    if config.complex_hidden_size == config.hidden_size and (config.head_dim % 2) == 0:
+        even_idx = torch.arange(0, config.head_dim, 2, device=target_device)
+        d16_model.model.rotary_emb.frequency_indices.copy_(torch.cat((even_idx, even_idx)))
 
     report = ConversionReport(min_orbit_score=min_orbit_score)
 
@@ -923,10 +936,13 @@ def import_qwen_weights(
         for proj_name in ("q_proj", "k_proj", "v_proj", "o_proj"):
             proj_mod = getattr(layer.self_attn, proj_name)
             pw = _require_tensor(state_dict, f"{p_m}.self_attn.{proj_name}.weight", f"{p_s}.self_attn.{proj_name}.weight")
-            _load_param(proj_mod.weight, pw, mode=second_coord_mode, sign=1.0)
+            is_qk = proj_name in ("q_proj", "k_proj") and second_coord_mode == "d16_sat_rope_gate"
+            pw_partner = _rope_head_half_partner(pw, config.head_dim) if is_qk else None
+            _load_param(proj_mod.weight, pw, mode=second_coord_mode, partner_w=pw_partner, sign=1.0)
             if proj_mod.bias is not None:
                 pb = _require_tensor(state_dict, f"{p_m}.self_attn.{proj_name}.bias", f"{p_s}.self_attn.{proj_name}.bias")
-                _load_param(proj_mod.bias, pb, mode="zero")
+                pb_partner = _rope_head_half_partner(pb, config.head_dim) if is_qk else None
+                _load_param(proj_mod.bias, pb, mode=(second_coord_mode if is_qk else "zero"), partner_w=pb_partner, sign=1.0)
 
         up_w = _require_tensor(state_dict, f"{p_m}.mlp.up_proj.weight", f"{p_s}.mlp.up_proj.weight")
         gate_w = _get_tensor(state_dict, f"{p_m}.mlp.gate_proj.weight", f"{p_s}.mlp.gate_proj.weight")
@@ -940,7 +956,7 @@ def import_qwen_weights(
             min_orbit_score=min_orbit_score,
         )
         report.layer_reports[idx] = layer_rep
-        im_mask = layer_rep.is_im_neuron
+        im_mask = layer_rep.is_im_neuron if second_coord_mode == "zero" else None
 
         _load_param(layer.mlp.up_proj.weight, up_w, is_im_mask=im_mask, im_dim=0, mode=second_coord_mode, partner_w=gate_w, sign=1.0)
         if layer.mlp.up_proj.bias is not None:
@@ -1197,6 +1213,9 @@ def load_d16_checkpoint(
     with _fast_empty_d16_init(dtype=target_dtype, device=target_device):
         d16_model = D16QwenForCausalLM(config)
     d16_model = d16_model.to(device=target_device)
+    if config.complex_hidden_size == config.hidden_size and (config.head_dim % 2) == 0:
+        even_idx = torch.arange(0, config.head_dim, 2, device=target_device)
+        d16_model.model.rotary_emb.frequency_indices.copy_(torch.cat((even_idx, even_idx)))
 
     # Cast floating-point coordinates (x, y) if an explicit dtype override was requested
     if dtype is not None:
