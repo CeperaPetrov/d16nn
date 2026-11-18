@@ -6,6 +6,7 @@ from dataclasses import replace
 import math
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -24,8 +25,12 @@ import torch
 from d16_adamw import D16AdamW
 from d16_complex import D16ComplexTensor
 from d16_parameter import D16Parameter
-from d16_qwen_importer import D16QwenImportConfig, import_qwen_weights, load_d16_checkpoint, save_d16_checkpoint
+from d16_qwen_importer import (
+    D16QwenImportConfig, WEDGE_HALF_SAT, WEDGE_SAT_SLOPE, compute_d16_second_coord,
+    import_qwen_weights, load_d16_checkpoint, pack_weights_1to1, save_d16_checkpoint,
+)
 from d16_qwen_model2 import D16QwenConfig, D16QwenForCausalLM, encode_token_ids
+from d16_vis_utils import relative_weight_shift
 
 
 class TestD16EncapsulationAndAutograd(unittest.TestCase):
@@ -275,7 +280,6 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
         self.assertLess(float((im_unpacked[im_mask] - up_orig[im_mask]).abs().max().item()), 1e-6)
 
         # Verify fast save_d16_checkpoint and load_d16_checkpoint round-trip
-        import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
             ckpt_dir = Path(tmpdir) / "d16_ckpt"
             save_d16_checkpoint(d16_model, ckpt_dir, report=report)
@@ -285,6 +289,161 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
             self.assertTrue(bool((r_up.x == up_d16.x).all()))
             self.assertTrue(bool((r_up.y == up_d16.y).all()))
             self.assertTrue(bool((r_up.rotation == up_d16.rotation).all()))
+
+    def test_rope_gate_computes_every_coordinate_with_an_explicit_partner(self) -> None:
+        for width in (1, 3, 4):
+            w = torch.arange(1, 1 + 4 * width, dtype=torch.float32).reshape(4, width)
+            partner = 1.5 - w.flip((0,))
+            sigma = w.square().mean().sqrt()
+            envelope = WEDGE_SAT_SLOPE * sigma * (w.abs() / (WEDGE_HALF_SAT * sigma + w.abs()))
+            expected = envelope * (partner / partner.square().mean().sqrt()).clamp(-3, 3)
+            torch.testing.assert_close(compute_d16_second_coord(w, partner_w=partner), expected)
+            for tile in (1, 3, 16):
+                z = pack_weights_1to1(w, partner_weight=partner, second_coord_mode="d16_sat_rope_gate", row_tile=tile)
+                real, imag = z.unpack()
+                torch.testing.assert_close(real, w)
+                torch.testing.assert_close(imag, expected)
+                self.assertTrue(imag[:, -1].ne(0).all())
+            if width % 2:
+                with self.assertRaisesRegex(ValueError, "even last dimension"):
+                    compute_d16_second_coord(w)
+                with self.assertRaisesRegex(ValueError, "even last dimension"):
+                    pack_weights_1to1(w, second_coord_mode="d16_sat_rope_gate")
+            else:
+                adjacent = torch.stack((-w[:, 1::2], w[:, ::2]), dim=-1).reshape_as(w)
+                torch.testing.assert_close(compute_d16_second_coord(w), envelope * (adjacent / sigma).clamp(-3, 3))
+        with self.assertRaisesRegex(ValueError, "same shape"):
+            compute_d16_second_coord(w, partner_w=w[:, :1])
+
+        vector = torch.tensor([1., 2., 3., 4.])
+        _, reconstructed = pack_weights_1to1(vector, second_coord_mode="d16_sat_rope_gate", row_tile=1).unpack()
+        torch.testing.assert_close(reconstructed, compute_d16_second_coord(vector))
+        with self.assertRaisesRegex(ValueError, "even last dimension"):
+            pack_weights_1to1(vector[:3], second_coord_mode="d16_sat_rope_gate", row_tile=2)
+        scalar = vector[0]
+        _, reconstructed = pack_weights_1to1(scalar, partner_weight=-scalar, second_coord_mode="d16_sat_rope_gate").unpack()
+        torch.testing.assert_close(reconstructed, compute_d16_second_coord(scalar, partner_w=-scalar))
+
+        sd = self._qwen_state_dict()
+        for idx in (0, 1):
+            for name, dim in (("up_proj", 0), ("gate_proj", 0), ("down_proj", 1)):
+                key = f"model.layers.{idx}.mlp.{name}.weight"
+                weight = sd[key]
+                sd[key] = torch.cat((weight, weight.narrow(dim, 0, 1)), dim=dim)
+        cfg = D16QwenImportConfig.from_state_dict(sd, num_attention_heads=4)
+        with patch("d16_qwen_importer.D16QwenForCausalLM") as allocate:
+            with self.assertRaisesRegex(ValueError, r"down_proj.*width 25"):
+                import_qwen_weights(sd, config=cfg, second_coord_mode="d16_sat_rope_gate", verbose=False)
+            allocate.assert_not_called()
+        model, _ = import_qwen_weights(sd, config=cfg, second_coord_mode="zero", verbose=False)
+        self.assertEqual(model.model.layers[0].mlp.down_proj.weight.value().shape, (16, 25))
+
+    @torch.no_grad()
+    def test_checkpoint_preserves_rope_grid_and_position_dependent_logits(self) -> None:
+        sd = self._qwen_state_dict()
+        cfg = D16QwenImportConfig.from_state_dict(sd, num_attention_heads=4)
+        native = D16QwenForCausalLM(cfg)
+        imported, _ = import_qwen_weights(sd, config=cfg, verbose=False)
+        tokens = encode_token_ids(torch.tensor([[1, 2, 3]]))
+        positions = torch.tensor([[0, 7, 31]])
+        def logits(model):
+            return model(tokens, position_ids=positions).logits.unpack()
+
+        key = "model.rotary_emb.frequency_indices"
+        native_grid, half_grid = torch.arange(4), torch.tensor([0, 2, 0, 2])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for model, grid, path in ((native, native_grid, root / "native"), (imported, half_grid, root / "import.pt")):
+                torch.testing.assert_close(model.state_dict()[key], grid)
+                expected = logits(model)
+                save_d16_checkpoint(model, path)
+                restored = load_d16_checkpoint(path, legacy_rope_layout="sequential")
+                torch.testing.assert_close(restored.state_dict()[key], grid)
+                torch.testing.assert_close(logits(restored), expected, rtol=0, atol=0)
+
+            legacy_file = root / "import.pt"
+            payload = torch.load(legacy_file, weights_only=True)
+            del payload["state_dict"][key]
+            torch.save(payload, legacy_file)
+            explicit = load_d16_checkpoint(legacy_file, legacy_rope_layout="half_head")
+            torch.testing.assert_close(logits(explicit), logits(imported), rtol=0, atol=0)
+            with self.assertWarnsRegex(UserWarning, "no saved RoPE grid"):
+                default = load_d16_checkpoint(legacy_file)
+            torch.testing.assert_close(default.state_dict()[key], native_grid)
+            sequential = load_d16_checkpoint(legacy_file, legacy_rope_layout="sequential")
+            torch.testing.assert_close(logits(default), logits(sequential), rtol=0, atol=0)
+            self.assertFalse(torch.equal(logits(sequential)[0], logits(explicit)[0]))
+
+            custom_grid = torch.tensor([3, 2, 1, 0])
+            imported.model.rotary_emb.frequency_indices.copy_(custom_grid)
+            save_d16_checkpoint(imported, legacy_file)
+            custom = load_d16_checkpoint(legacy_file, legacy_rope_layout="half_head")
+            torch.testing.assert_close(custom.state_dict()[key], custom_grid)
+            torch.testing.assert_close(logits(custom), logits(imported), rtol=0, atol=0)
+
+            old_state = native.state_dict()
+            del old_state[key]
+            with self.assertRaisesRegex(RuntimeError, "frequency_indices"):
+                native.load_state_dict(old_state)
+            old_state._metadata["model.rotary_emb"]["version"] = 1
+            native.load_state_dict(old_state, strict=True)
+            torch.testing.assert_close(native.state_dict()[key], native_grid)
+
+    def test_report_retains_actual_source_axes_and_migrates_legacy_reports(self) -> None:
+        sd = self._qwen_state_dict()
+        sd["lm_head.weight"] = torch.randn_like(sd["model.embed_tokens.weight"])
+        cfg = D16QwenImportConfig.from_state_dict(sd, num_attention_heads=4)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "report.pt"
+            for mode in ("zero", "d16_sat_rope_gate"):
+                model, report = import_qwen_weights(sd, config=cfg, min_orbit_score=0.60, second_coord_mode=mode, verbose=False)
+                layer = report.layer_reports[0]
+                self.assertTrue(layer.is_im_neuron.any())
+                mask = layer.is_im_neuron if mode == "zero" else torch.zeros_like(layer.is_im_neuron)
+                torch.testing.assert_close(layer.source_im_mask, mask)
+                for name in ("up_proj", "gate_proj", "down_proj"):
+                    weight = getattr(model.model.layers[0].mlp, name).weight.value()
+                    real, imag = weight.unpack()
+                    axes = mask[None, :] if name == "down_proj" else mask[:, None]
+                    orig = sd[f"model.layers.0.mlp.{name}.weight"]
+                    torch.testing.assert_close(torch.where(axes, imag, real), orig)
+                    if mode == "d16_sat_rope_gate":
+                        partner_name = {"up_proj": "gate_proj", "gate_proj": "up_proj"}.get(name)
+                        partner = sd[f"model.layers.0.mlp.{partner_name}.weight"] if partner_name else None
+                        torch.testing.assert_close(imag, compute_d16_second_coord(orig, partner_w=partner))
+                if mode == "d16_sat_rope_gate":
+                    for key, param in (("model.embed_tokens.weight", model.model.embed_tokens.weight), ("lm_head.weight", model.lm_head.weight)):
+                        real, imag = param.value().unpack()
+                        torch.testing.assert_close((real, imag), (sd[key], compute_d16_second_coord(sd[key])))
+                save_d16_checkpoint(model, path, report=report)
+                _, restored = load_d16_checkpoint(path, return_report=True)
+                torch.testing.assert_close(restored.layer_reports[0].source_im_mask, mask)
+                payload = torch.load(path, weights_only=True)
+                saved_report = payload["d16_orbit_report"]
+                for row in saved_report["layer_reports"].values():
+                    del row["source_im_mask"]
+                torch.save(payload, path)
+                _, legacy = load_d16_checkpoint(path, return_report=True)
+                torch.testing.assert_close(legacy.layer_reports[0].source_im_mask, mask)
+                torch.testing.assert_close(legacy.layer_reports[0].is_im_neuron, layer.is_im_neuron)
+                del saved_report["total_im_weights"]
+                torch.save(payload, path)
+                _, unknown = load_d16_checkpoint(path, return_report=True)
+                self.assertIsNone(unknown.layer_reports[0].source_im_mask)
+
+    def test_relative_weight_shift_across_sectors(self) -> None:
+        pos = D16ComplexTensor.from_real(torch.tensor([1.]))
+        self.assertEqual(relative_weight_shift(pos, -pos), 2.0)
+        self.assertEqual(relative_weight_shift(pos, pos), 0.0)
+        zero = D16ComplexTensor.zeros((1,))
+        self.assertTrue(math.isinf(relative_weight_shift(zero, pos)))
+        self.assertTrue(math.isnan(relative_weight_shift(zero, zero)))
+        real = torch.tensor([[1., -0.5], [-2., 0.2]], dtype=torch.float64)
+        imag = torch.tensor([[0.1, 0.5], [-1., 2.]], dtype=torch.float64)
+        initial = D16ComplexTensor.pack(real, imag)
+        after = D16ComplexTensor.pack(-imag, real)
+        reference = ((-imag - real).square() + (real - imag).square()).sum() / (real.square() + imag.square()).sum()
+        self.assertAlmostEqual(relative_weight_shift(initial, after), reference.sqrt().item(), places=12)
 
     def test_import_checks_tensor_shapes_before_model_allocation(self) -> None:
         sd = self._qwen_state_dict()
