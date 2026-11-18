@@ -3,3 +3,6 @@
 qwen/ipynb/d16_qwen_checkpoint/d16_orbit_report.pt
 qwen/ipynb/d16_qwen_checkpoint/d16_config.json
 qwen/ipynb/d16_qwen_checkpoint/d16_model.safetensors
+qwen/ipynb/d16_qwen_05b_rope_gate_ckpt/d16_config.json
+qwen/ipynb/d16_qwen_05b_rope_gate_ckpt/d16_model.safetensors
+qwen/ipynb/d16_qwen_05b_rope_gate_ckpt/d16_orbit_report.pt
