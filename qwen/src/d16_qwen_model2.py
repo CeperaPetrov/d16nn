@@ -193,11 +193,25 @@ class D16RMSNorm(nn.Module):
 class D16RotaryEmbedding(nn.Module):
     """One D16 rotation per complex head channel."""
 
+    _version = 2  # Earlier state dicts kept the RoPE grid only in memory.
+
     def __init__(self, head_dim: int, base: float = 1000000.0) -> None:
         super().__init__()
         self.head_dim = head_dim
         self.base = base
-        self.register_buffer("frequency_indices", torch.arange(head_dim), persistent=False)
+        self.register_buffer("frequency_indices", torch.arange(head_dim))
+
+    def use_qwen_half_head_frequencies(self) -> None:
+        """Give corresponding channels in the two halves of a Qwen head the same frequency."""
+        if self.head_dim % 2:
+            raise ValueError("Qwen half-head RoPE requires an even head_dim")
+        even_indices = torch.arange(0, self.head_dim, 2, device=self.frequency_indices.device)
+        self.frequency_indices.copy_(even_indices.repeat(2))
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, *args):
+        if local_metadata.get("version", 1) < 2:
+            state_dict.setdefault(prefix + "frequency_indices", self.frequency_indices)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, *args)
 
     def forward(
         self, hidden_states: D16ComplexTensor, position_ids: torch.Tensor
