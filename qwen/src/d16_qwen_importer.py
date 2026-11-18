@@ -31,7 +31,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from d16_complex import D16ComplexTensor, INV_SQRT2
+from d16_complex import D16ComplexTensor, INV_SQRT2, TAN_PI_8
 from d16_parameter import D16Parameter
 from d16_qwen_model2 import D16QwenConfig, D16QwenForCausalLM, IndiffThreshold, MLPActivation
 
@@ -518,13 +518,22 @@ def find_mlp_quartets(
 
 _PACK_ROW_TILE: int = 4096
 
+# Фундаментальные геометрические константы реконструкции 2-й координаты в клине [0°, 22.5°]:
+# - WEDGE_SAT_SLOPE = TAN_PI_8 / 4 : четверть наклона биссектрисы (после билинейного умножения даёт середину клина TAN_PI_8 / 2)
+# - WEDGE_HALF_SAT  = (TAN_PI_8 ** 2) * INV_SQRT2 : радиус полунасыщения в единицах глобального RMS матрицы
+WEDGE_SAT_SLOPE: float = 0.25 * TAN_PI_8
+WEDGE_HALF_SAT: float = (TAN_PI_8 ** 2) * INV_SQRT2
+
+
 @torch.no_grad()
 def compute_d16_second_coord(
     w: torch.Tensor,
-    mode: str = "d16_sat_det",
+    mode: str = "d16_sat_rope_gate",
     *,
-    c_sat: float = 0.205,
-    c_w0: float = 0.120,
+    partner_w: Optional[torch.Tensor] = None,
+    c_sat: float = WEDGE_SAT_SLOPE,
+    c_w0: float = WEDGE_HALF_SAT,
+    sign: float = 1.0,
 ) -> torch.Tensor:
     """Compute the complementary D16 coordinate w2 = f(w1) via D16 radial saturation."""
     if mode == "zero":
@@ -551,7 +560,16 @@ def compute_d16_second_coord(
             parity = torch.where(((idx_prev + idx_last) & 1) == 0, 1.0, -1.0)
         else:
             parity = torch.where((idx_last & 1) == 0, 1.0, -1.0)
-        xi = (dw / dw_std) * parity
+        xi = (sign * (dw / dw_std) * parity).clamp(-3.0, 3.0)
+    elif mode == "d16_sat_rope_gate":
+        if partner_w is not None and partner_w.shape == wf.shape:
+            pw = partner_w.detach().to(device=wf.device, dtype=torch.float32)
+            pw_std = pw.square().mean().sqrt().clamp_min(1e-8)
+        else:
+            w_pairs = wf.view(*wf.shape[:-1], wf.shape[-1] // 2, 2)
+            pw = torch.stack([-w_pairs[..., 1], w_pairs[..., 0]], dim=-1).reshape_as(wf)
+            pw_std = sigma_w
+        xi = (sign * (pw / pw_std)).clamp(-3.0, 3.0)
     else:
         raise ValueError(f"Unknown second_coord_mode: {mode!r}")
 
@@ -567,8 +585,8 @@ def _compute_w2_slice(
     partner_slice: Optional[torch.Tensor] = None,
     sigma_partner: Optional[torch.Tensor] = None,
     row_offset: int = 0,
-    c_sat: float = 0.090,
-    c_w0: float = 0.120,
+    c_sat: float = WEDGE_SAT_SLOPE,
+    c_w0: float = WEDGE_HALF_SAT,
     sign: float = 1.0,
 ) -> torch.Tensor:
     """Compute 2nd coordinate w2 for a row slice using global matrix statistics (sigma_w, sigma_partner)."""
@@ -611,7 +629,7 @@ def _compute_global_sigmas_tiled(
     partner_w: Optional[torch.Tensor] = None,
     *,
     dtype: torch.dtype,
-    c_sat: float = 0.090,
+    c_sat: float = WEDGE_SAT_SLOPE,
     row_tile: int = _PACK_ROW_TILE,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Accumulate global RMS in tiles after rounding each input to the destination dtype."""
@@ -652,8 +670,8 @@ def pack_weights_1to1(
     im_dim: int = 0,
     second_coord_mode: str = "zero",
     partner_weight: Optional[torch.Tensor] = None,
-    c_sat: float = 0.090,
-    c_w0: float = 0.120,
+    c_sat: float = WEDGE_SAT_SLOPE,
+    c_w0: float = WEDGE_HALF_SAT,
     sign: float = 1.0,
     row_tile: int = _PACK_ROW_TILE,
     out: Optional[D16ComplexTensor] = None,
@@ -812,8 +830,8 @@ def import_qwen_weights(
     indiff_rel: float = 0.25,
     mlp_activation: MLPActivation = "bilinear",
     second_coord_mode: str = "zero",
-    c_sat: float = 0.090,
-    c_w0: float = 0.120,
+    c_sat: float = WEDGE_SAT_SLOPE,
+    c_w0: float = WEDGE_HALF_SAT,
     dtype: Optional[torch.dtype] = None,
     device: Optional[Union[str, torch.device]] = None,
     verbose: bool = True,
@@ -881,15 +899,15 @@ def import_qwen_weights(
         report.total_im_weights += im_cnt
         report.total_re_weights += n_el - im_cnt
 
-    # 1. Embeddings (kept on the reference 0° axis), Final Norm, LM Head
-    _load_param(d16_model.model.embed_tokens.weight, emb_w, mode="zero")
+    # 1. Embeddings, Final Norm, LM Head
+    _load_param(d16_model.model.embed_tokens.weight, emb_w, mode=second_coord_mode, sign=1.0)
 
     norm_w = _require_tensor(state_dict, "model.norm.weight", "norm.weight")
     _load_param(d16_model.model.norm.gain, norm_w, mode="zero")
 
     if not config.tie_word_embeddings:
         lm_w = _require_tensor(state_dict, "lm_head.weight")
-        _load_param(d16_model.lm_head.weight, lm_w, mode="zero")
+        _load_param(d16_model.lm_head.weight, lm_w, mode=second_coord_mode, sign=1.0)
 
     # 2. Decoder Layers
     for idx, layer in enumerate(d16_model.model.layers):
@@ -931,7 +949,7 @@ def import_qwen_weights(
 
         if layer.mlp.gate_proj is not None:
             gate_req = _require_tensor(state_dict, f"{p_m}.mlp.gate_proj.weight", f"{p_s}.mlp.gate_proj.weight")
-            _load_param(layer.mlp.gate_proj.weight, gate_req, is_im_mask=im_mask, im_dim=0, mode=second_coord_mode, partner_w=up_w, sign=-1.0)
+            _load_param(layer.mlp.gate_proj.weight, gate_req, is_im_mask=im_mask, im_dim=0, mode=second_coord_mode, partner_w=up_w, sign=1.0)
             if layer.mlp.gate_proj.bias is not None:
                 gate_b = _require_tensor(state_dict, f"{p_m}.mlp.gate_proj.bias", f"{p_s}.mlp.gate_proj.bias")
                 _load_param(layer.mlp.gate_proj.bias, gate_b, is_im_mask=im_mask, im_dim=0, mode="zero")
@@ -1202,11 +1220,14 @@ def load_d16_checkpoint(
 
 
 __all__ = [
+    "WEDGE_SAT_SLOPE",
+    "WEDGE_HALF_SAT",
     "D16QwenImportConfig",
     "LayerOrbitReport",
     "ConversionReport",
     "load_qwen_checkpoint",
     "find_mlp_quartets",
+    "compute_d16_second_coord",
     "pack_weights_1to1",
     "import_qwen_weights",
     "print_import_summary",
