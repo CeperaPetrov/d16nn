@@ -1171,7 +1171,7 @@ def load_d16_checkpoint(
     report: Optional[ConversionReport] = None
 
     if target.is_file() and target.suffix in (".pt", ".pth", ".bin"):
-        raw = torch.load(str(target), map_location=target_device, weights_only=False)
+        raw = torch.load(str(target), map_location="cpu", weights_only=False)
         cfg_dict = raw["d16_config"]
         state_dict = raw["state_dict"]
         if "d16_orbit_report" in raw and raw["d16_orbit_report"] is not None:
@@ -1186,10 +1186,10 @@ def load_d16_checkpoint(
         pt_file = target / "d16_model.pt"
         if st_file.is_file():
             from safetensors.torch import load_file
-            st_dev = f"cuda:{torch.cuda.current_device()}" if target_device.type == "cuda" and target_device.index is None else str(target_device)
+            st_dev = "cpu" #f"cuda:{torch.cuda.current_device()}" if target_device.type == "cuda" and target_device.index is None else str(target_device)
             state_dict = load_file(str(st_file), device=st_dev)
         elif pt_file.is_file():
-            state_dict = torch.load(str(pt_file), map_location=target_device, weights_only=True)
+            state_dict = torch.load(str(pt_file), map_location="cpu", weights_only=True)
         else:
             raise FileNotFoundError(f"No 'd16_model.safetensors' or 'd16_model.pt' found in: {target}")
 
