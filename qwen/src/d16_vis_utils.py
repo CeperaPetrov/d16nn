@@ -26,7 +26,13 @@ except ImportError:  # pragma: no cover
         from d16_qwen_converter import ConversionReport, LayerOrbitReport
     except ImportError:
         ConversionReport = LayerOrbitReport = object  # type: ignore[misc,assignment]
-from d16_qwen_model import D16QwenMLP
+try:
+    from d16_qwen_model import D16QwenMLP
+except ImportError:  # pragma: no cover
+    try:
+        from d16_qwen_model2 import D16QwenMLP
+    except ImportError:
+        D16QwenMLP = object  # type: ignore[misc,assignment]
 
 
 # =====================================================================
@@ -235,6 +241,19 @@ def snapshot_d16_weight_states(
     for name, mod in _iter_complex_d16_parameters(model, include_biases=include_biases):
         snapshot[name] = mod.value().detach().cpu().clone()
     return snapshot
+
+
+@torch.no_grad()
+def relative_weight_shift(initial: D16ComplexTensor, current: D16ComplexTensor) -> float:
+    """Frobenius norm of the D16 displacement divided by the initial norm (NaN for 0/0)."""
+    if initial.shape != current.shape:
+        raise ValueError("Weight snapshots must have the same shape")
+    dtype = torch.float64 if torch.float64 in (initial.dtype, current.dtype) else torch.float32
+    initial = initial.to(dtype)
+    delta = current.to(device=initial.device, dtype=dtype) - initial
+    shift_sq = delta.norm_squared().masked_fill(delta.is_nan(), torch.nan).sum(dtype=torch.float64)
+    initial_sq = initial.norm_squared().masked_fill(initial.is_nan(), torch.nan).sum(dtype=torch.float64)
+    return float((shift_sq / initial_sq).sqrt().item())
 
 
 @torch.no_grad()
@@ -884,6 +903,7 @@ __all__ = [
     "plot_layer_z8z2_spectrum",
     "plot_learned_sector_gains",
     "snapshot_d16_weight_states",
+    "relative_weight_shift",
     "print_d16_weight_migration_table",
     "plot_d16_weight_sector_distribution",
     "plot_d16_sector_transition_matrix",
