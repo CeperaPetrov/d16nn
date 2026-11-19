@@ -680,12 +680,10 @@ if _HAS_TORCH:
         return _state_table(m.device)[m.to(torch.long) & 0xFFFF]
 
     def on_bisector_d16(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        scale = torch.maximum(x, y)
-        valid = (scale > 0.0) & torch.isfinite(scale)
-        safe_scale = torch.where(valid, scale, torch.ones_like(scale))
-        nx = x / safe_scale
-        ny = y / safe_scale
-        return valid & (((nx - ny) - SQRT2 * ny).abs() <= EPS_BOUND * (nx + ny))
+        valid = (x > 0.0) & torch.isfinite(x) & (y >= 0.0) & (y <= x)
+        safe_x = torch.where(valid, x, 1.0)
+        ny = y / safe_x
+        return valid & (((1.0 - ny) - SQRT2 * ny).abs() <= EPS_BOUND * (1.0 + ny))
 
     def above_bisector_d16(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         scale = torch.maximum(x, y)
