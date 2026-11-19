@@ -1115,6 +1115,24 @@ if _HAS_TORCH:
     def _scale_wedge(z: "D16ComplexTensor", scale: Union[float, int, torch.Tensor]) -> "D16ComplexTensor":
         """Scale a D16ComplexTensor by a real scalar or tensor (handling negative scales via 180° shift)."""
         if not isinstance(scale, torch.Tensor):
+            s = (
+                float(scale)
+                if z.dtype == torch.float64
+                else float(torch.tensor(scale, dtype=z.dtype).item())
+            )
+            if math.isfinite(s):
+                neg = s < 0.0
+                mag = -s if neg else s
+                x = z.x * mag
+                y = z.y * mag
+                undefined = z.is_nan() | ~torch.isfinite(x) | ~torch.isfinite(y)
+                rot = apply_group_op_u16(z.rotation, 4) if neg else z.rotation
+                mask = torch.where((x == 0) & (y == 0), MASK_ZERO, rot)
+                return D16ComplexTensor(
+                    x.masked_fill(undefined, 0),
+                    y.masked_fill(undefined, 0),
+                    mask.masked_fill(undefined, MASK_NAN),
+                )
             scale_t = z.x.new_tensor(scale)
         else:
             scale_t = scale.to(device=z.device)
