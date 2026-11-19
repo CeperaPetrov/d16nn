@@ -742,6 +742,33 @@ if _HAS_TORCH:
         oy = torch.where(on_bis, ox * TAN_PI_8, y).masked_fill(zero_out | on_y0, 0.0)
         return ox, oy, mask
 
+    def _d16_make_unchecked(
+        x: torch.Tensor,
+        y: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fold validated finite nonnegative (x, y) and u16 mask into the [0°, 22.5°] wedge."""
+        nan_mask = mask == MASK_NAN
+        is_zero = (x == 0.0) & (y == 0.0) & (~nan_mask)
+        k = even_anchor_u16(mask).to(torch.int32)
+
+        swap_xy = y > x
+        nx = torch.where(swap_xy, y, x)
+        ny = torch.where(swap_xy, x, y)
+        k = torch.where(swap_xy, (k + torch.where((k & 1) != 0, 13, 3)) & 15, k)
+
+        valid = nx > 0.0
+        safe_nx = torch.where(valid, nx, 1.0)
+        ratio = ny / safe_nx
+        fold_bis = valid & ((1.0 - ratio) < (SQRT2 * ratio - EPS_BOUND))
+        fx = torch.where(fold_bis, safe_nx * ((1.0 + ratio) * INV_SQRT2), nx)
+        fy = torch.where(fold_bis, (nx - ny) * INV_SQRT2, ny)
+        k = k ^ fold_bis.to(torch.int32)
+
+        rx, ry, rmask = d16_reduced_u16(fx, fy, k, is_zero)
+        rmask.masked_fill_(nan_mask, MASK_NAN)
+        return rx.masked_fill(nan_mask, 0.0), ry.masked_fill(nan_mask, 0.0), rmask
+
     def d16_make_u16(
         x: torch.Tensor,
         y: torch.Tensor,
@@ -755,27 +782,7 @@ if _HAS_TORCH:
         is_zero = (x == 0.0) & (y == 0.0) & (mask != MASK_NAN)
         if bool(((~is_zero) & (mask == MASK_ZERO)).any()):
             raise ValueError("0xFFFF is reserved for zero")
-
-        k = even_anchor_u16(mask)
-        swap_xy = y > x
-        nx = torch.where(swap_xy, y, x)
-        ny = torch.where(swap_xy, x, y)
-        delta_k = torch.where((k & 1) != 0, 13, 3)
-        k = torch.where(swap_xy, (k + delta_k) & 15, k)
-
-        fold_bis = above_bisector_d16(nx, ny)
-        bx = rotated_sum_d16(nx, ny)
-        by = (nx - ny) * INV_SQRT2
-        fx = torch.where(fold_bis, bx, nx)
-        fy = torch.where(fold_bis, by, ny)
-        k = torch.where(fold_bis, k ^ 1, k)
-
-        rx, ry, rmask = d16_reduced_u16(fx, fy, k, is_zero)
-        nan_mask = mask == MASK_NAN
-        rx = torch.where(nan_mask, torch.zeros_like(rx), rx)
-        ry = torch.where(nan_mask, torch.zeros_like(ry), ry)
-        rmask = torch.where(nan_mask, torch.zeros_like(rmask), rmask)
-        return rx, ry, rmask
+        return _d16_make_unchecked(x, y, mask)
 
     def d16_from_xy_u16(
         logic: torch.Tensor,
@@ -1372,10 +1379,12 @@ if _HAS_TORCH:
                 return self
             nx, ny = self.x.to(dtype), self.y.to(dtype)
             undefined = self.is_nan() | ~torch.isfinite(nx) | ~torch.isfinite(ny)
-            return D16ComplexTensor.make(
-                nx.masked_fill(undefined, 0.0),
-                ny.masked_fill(undefined, 0.0),
-                self.rotation.masked_fill(undefined, MASK_NAN),
+            return D16ComplexTensor(
+                *_d16_make_unchecked(
+                    nx.masked_fill(undefined, 0.0),
+                    ny.masked_fill(undefined, 0.0),
+                    self.rotation.masked_fill(undefined, MASK_NAN),
+                )
             )
 
         def clone(self) -> "D16ComplexTensor":
