@@ -933,13 +933,28 @@ if _HAS_TORCH:
         chart = _chart_table(rotation.device)[rotation.to(torch.long)]
         return (chart & 7).long(), (chart & 8) != 0
 
-    def _rotation_basis(turns: torch.Tensor, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
-        def sine(angle: torch.Tensor) -> torch.Tensor:
-            axis_magnitude = ((angle & 3) == 2).to(dtype=dtype)
-            magnitude = torch.where((angle & 1) != 0, INV_SQRT2, axis_magnitude)
-            return torch.where(angle < 4, magnitude, -magnitude)
+    @lru_cache(maxsize=None)
+    def _rotation_basis_table(
+        device: torch.device, dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if device.type != "cpu":
+            cos_cpu, sin_cpu = _rotation_basis_table(torch.device("cpu"), dtype)
+            return cos_cpu.to(device), sin_cpu.to(device)
+        cos_table = torch.tensor(
+            (1.0, INV_SQRT2, 0.0, -INV_SQRT2, -1.0, -INV_SQRT2, 0.0, INV_SQRT2),
+            dtype=dtype,
+            device=device,
+        )
+        sin_table = torch.tensor(
+            (0.0, INV_SQRT2, 1.0, INV_SQRT2, 0.0, -INV_SQRT2, -1.0, -INV_SQRT2),
+            dtype=dtype,
+            device=device,
+        )
+        return cos_table, sin_table
 
-        return sine((turns + 2) & 7), sine(turns)
+    def _rotation_basis(turns: torch.Tensor, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        cos_table, sin_table = _rotation_basis_table(turns.device, dtype)
+        return cos_table[turns], sin_table[turns]
 
     def _from_chart(
         x: torch.Tensor, y: torch.Tensor, rotation: torch.Tensor
