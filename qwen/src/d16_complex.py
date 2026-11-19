@@ -909,29 +909,28 @@ if _HAS_TORCH:
         out = rol_u16(base_m, 2 * (op & 7))
         return torch.where(special, m, out)
 
-    def apply_all_16_d16_ops_u16(m: torch.Tensor) -> torch.Tensor:
-        """Return stack [..., 16] of masks under all 16 dihedral operations."""
-        special = (m == MASK_ZERO) | (m == MASK_NAN)
-        rev = reverse_bits_u16(m)
-        raw = torch.stack([
-            m,                     # 0:  (+L, +E)
-            rol_u16(m, 8),         # 1:  (-L, -E)
-            rev,                   # 2:  (+L, -E)
-            rol_u16(rev, 8),       # 3:  (-L, +E)
-            rol_u16(m, 4),         # 4:  (-E, +L)
-            ror_u16(m, 4),         # 5:  (+E, -L)
-            rol_u16(rev, 4),       # 6:  (+E, +L)
-            rol_u16(rev, 12),      # 7:  (-E, -L)
-            rol_u16(m, 2),         # 8:  ( L-E,  L+E)/sqrt(2)
-            rol_u16(m, 6),         # 9:  (-L-E,  L-E)/sqrt(2)
-            rol_u16(m, 10),        # 10: (-L+E, -L-E)/sqrt(2)
-            rol_u16(m, 14),        # 11: ( L+E, -L+E)/sqrt(2)
-            rol_u16(rev, 2),       # 12: ( L+E,  L-E)/sqrt(2)
-            rol_u16(rev, 6),       # 13: (-L+E,  L+E)/sqrt(2)
-            rol_u16(rev, 10),      # 14: (-L-E, -L+E)/sqrt(2)
-            rol_u16(rev, 14),      # 15: ( L-E, -L-E)/sqrt(2)
-        ], dim=-1)
-        return torch.where(special.unsqueeze(-1), m.unsqueeze(-1), raw)
+    @lru_cache(maxsize=None)
+    def _dihedral_op_table(device: torch.device) -> torch.Tensor:
+        """16 x 65536 int32 lookup table for all Z_8 |>< Z_2 actions on 16-bit masks."""
+        if device.type != "cpu":
+            return _dihedral_op_table(torch.device("cpu")).to(device)
+        m = torch.arange(1 << 16, dtype=torch.int32, device=device)
+        rev = _reverse_bits_table(device)
+        rows = []
+        for refl in (0, 1):
+            base = rev if refl else m
+            for turn in range(8):
+                shift = turn * 2
+                rows.append(
+                    base if shift == 0 else (((base << shift) | (base >> (16 - shift))) & MASK_ZERO)
+                )
+        return torch.stack(rows, dim=0)
+
+    def apply_group_op_u16(m: torch.Tensor, op_id: int) -> torch.Tensor:
+        """Apply Z_8 |>< Z_2 element op_id in 0..15 purely to 16-bit mask tensor."""
+        idx = m if m.dtype in (torch.int32, torch.int64) else m.to(torch.int32)
+        out = _dihedral_op_table(m.device)[op_id & 15][idx & 0xFFFF]
+        return out if out.dtype == m.dtype else out.to(m.dtype)
 
     # =====================================================================
     # 5. ENCAPSULATED LOCAL CHARTS, AUTOGRAD & REAL-AXIS SUBALGEBRA
@@ -997,9 +996,15 @@ if _HAS_TORCH:
         local_mask: torch.Tensor, turns: torch.Tensor, reflected: torch.Tensor
     ) -> torch.Tensor:
         """Compose a local mask with a chart's reflection and 45-degree turns."""
-        relative_mask = torch.where(reflected, reverse_bits_u16(local_mask), local_mask)
-        shift = turns << 1
-        return ((relative_mask << shift) | (relative_mask >> ((-shift) & 15))) & MASK_ZERO
+        lm = (
+            local_mask
+            if local_mask.dtype in (torch.int32, torch.int64)
+            else local_mask.to(torch.int32)
+        )
+        t32 = turns if turns.dtype == torch.int32 else turns.to(torch.int32)
+        chart = (t32 & 7) | (reflected.to(torch.int32) << 3)
+        out = _dihedral_op_table(local_mask.device)[chart, lm & 0xFFFF]
+        return out if out.dtype == local_mask.dtype else out.to(local_mask.dtype)
 
     class _PackComplex(torch.autograd.Function):
         @staticmethod
