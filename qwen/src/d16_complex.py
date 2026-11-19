@@ -1345,11 +1345,11 @@ if _HAS_TORCH:
             ny = self.y.to(*args, **kwargs)
             nrot = self.rotation.to(device=nx.device)
             undefined = (nrot == MASK_NAN) | ~torch.isfinite(nx) | ~torch.isfinite(ny)
-            if bool(undefined.any()):
-                nx = nx.masked_fill(undefined, 0.0)
-                ny = ny.masked_fill(undefined, 0.0)
-                nrot = nrot.masked_fill(undefined, MASK_NAN)
-            return D16ComplexTensor(nx, ny, nrot)
+            return D16ComplexTensor(
+                nx.masked_fill(undefined, 0.0),
+                ny.masked_fill(undefined, 0.0),
+                nrot.masked_fill(undefined, MASK_NAN),
+            )
 
         def cpu(self, memory_format: torch.memory_format = torch.preserve_format) -> "D16ComplexTensor":
             """Move D16ComplexTensor coordinates and rotation mask to CPU memory."""
