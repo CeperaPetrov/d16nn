@@ -63,7 +63,7 @@ class D16AdamW:
         weight_decay: float = 0.01,
         indiff_eps: IndiffThreshold = 0.0,
         indiff_rel: float = 0.25,
-        tile_size: int = 1 << 20,
+        tile_size: int = 1 << 22,
     ) -> None:
         self.parameters = tuple(dict.fromkeys(parameters))
         if not self.parameters:
