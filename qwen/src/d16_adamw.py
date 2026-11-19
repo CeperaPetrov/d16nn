@@ -139,7 +139,11 @@ class D16AdamW:
         )
         if not bool(torch.isfinite(total_norm)):
             raise RuntimeError("D16 tangent norm is nonfinite")
-        clip = None if max_grad_norm is None else (max_grad_norm / (total_norm + 1e-6)).clamp(max=1)
+        clip = (
+            None
+            if max_grad_norm is None
+            else min(1.0, max_grad_norm / (float(total_norm.item()) + 1e-6))
+        )
 
         for i, parameter in enumerate(self.parameters):
             if not parameter.has_grad():
@@ -150,37 +154,36 @@ class D16AdamW:
             self._update(parameter, moments, clip)
         return total_norm
 
-    def _update(self, parameter: D16Parameter, moments: _Moments, clip: torch.Tensor | None) -> None:
+    def _update(self, parameter: D16Parameter, moments: _Moments, clip: float | None) -> None:
         beta1, beta2 = self.betas
         moments.step += 1
         step_size = self.lr / (1.0 - beta1 ** moments.step)
         correction2 = 1.0 - beta2 ** moments.step
         decay = 1.0 - self.lr * self.weight_decay
+        clip_scale = 1.0 if clip is None else clip
+        grad_scale = (1.0 - beta1) * clip_scale
+        second_scale = (1.0 - beta2) * (clip_scale * clip_scale)
         dtype = moments.first.dtype
         weights = parameter.value()
-        clip_val = None if clip is None else clip.to(device=weights.device, dtype=dtype)
 
         for index in self._tiles(parameter):
             stored_weight = weights[index]
             weight = stored_weight.to(dtype=dtype)
             gradient = parameter.grad_d16(index=index, dtype=dtype)
-            if clip_val is not None:
-                gradient = gradient * clip_val
 
             prev_first = moments.first[index]
             prev_second = moments.second[index]
 
-            # First moment uses D16ComplexTensor arithmetic; second moment is a real scalar EMA:
-            first = prev_first * beta1 + gradient * (1.0 - beta1)
+            # First moment uses D16ComplexTensor arithmetic; second moment is an in-place real EMA:
+            first = prev_first * beta1 + gradient * grad_scale
             grad_norm_sq = gradient.norm_squared().masked_fill(gradient.is_nan(), float("nan"))
-            second = prev_second * beta2 + grad_norm_sq * (1.0 - beta2)
-            denom = (second / correction2).sqrt() + self.eps
-            delta = first * (step_size / denom)
+            prev_second.mul_(beta2).add_(grad_norm_sq, alpha=second_scale)
+            step_scale = prev_second.div(correction2).sqrt_().add_(self.eps).reciprocal_().mul_(step_size)
+            delta = first * step_scale
             updated = weight * decay - delta
 
             parameter.copy_(updated.round_to_dtype(stored_weight.dtype), index=index)
             moments.first.copy_slice_(index, first)
-            moments.second[index].copy_(second)
 
         if self._should_apply_indiff_threshold(parameter):
             parameter.copy_(
