@@ -624,7 +624,9 @@ if _HAS_TORCH:
 
     def reverse_bits_u16(m: torch.Tensor) -> torch.Tensor:
         """Vectorized 16-bit bit reversal."""
-        return _reverse_bits_table(m.device)[m.to(torch.long) & 0xFFFF].to(m.dtype)
+        idx = m if m.dtype in (torch.int32, torch.int64) else m.to(torch.int32)
+        out = _reverse_bits_table(m.device)[idx & 0xFFFF]
+        return out if out.dtype == m.dtype else out.to(m.dtype)
 
     @lru_cache(maxsize=None)
     def _bit_index_table(device: torch.device) -> torch.Tensor:
@@ -948,8 +950,9 @@ if _HAS_TORCH:
 
     def _chart_parameters(rotation: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Extract 45-degree turn index (0..7) and reflection flag from a 16-bit mask."""
-        chart = _chart_table(rotation.device)[rotation.to(torch.long)]
-        return (chart & 7).long(), (chart & 8) != 0
+        idx = rotation if rotation.dtype in (torch.int32, torch.int64) else rotation.to(torch.int32)
+        chart = _chart_table(rotation.device)[idx]
+        return (chart & 7).to(torch.int32), (chart & 8) != 0
 
     @lru_cache(maxsize=None)
     def _rotation_basis_table(
@@ -995,7 +998,7 @@ if _HAS_TORCH:
     ) -> torch.Tensor:
         """Compose a local mask with a chart's reflection and 45-degree turns."""
         relative_mask = torch.where(reflected, reverse_bits_u16(local_mask), local_mask)
-        shift = turns * 2
+        shift = turns << 1
         return ((relative_mask << shift) | (relative_mask >> ((-shift) & 15))) & MASK_ZERO
 
     class _PackComplex(torch.autograd.Function):
