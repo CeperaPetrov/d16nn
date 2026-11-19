@@ -620,12 +620,44 @@ if _HAS_TORCH:
         m = ((m & 0xAAAA) >> 1) | ((m & 0x5555) << 1)
         return m & 0xFFFF
 
+    @lru_cache(maxsize=None)
+    def _bit_index_table(device: torch.device) -> torch.Tensor:
+        if device.type != "cpu":
+            return _bit_index_table(torch.device("cpu")).to(device)
+        return torch.tensor(
+            [bit_index(mask) for mask in range(1 << 16)],
+            dtype=torch.long,
+            device=device,
+        )
+
+    @lru_cache(maxsize=None)
+    def _even_anchor_table(device: torch.device) -> torch.Tensor:
+        if device.type != "cpu":
+            return _even_anchor_table(torch.device("cpu")).to(device)
+        return torch.tensor(
+            [even_anchor(mask) for mask in range(1 << 16)],
+            dtype=torch.long,
+            device=device,
+        )
+
+    @lru_cache(maxsize=None)
+    def _state_table(device: torch.device) -> torch.Tensor:
+        if device.type != "cpu":
+            return _state_table(torch.device("cpu")).to(device)
+        states = []
+        for mask in range(1 << 16):
+            if mask == MASK_ZERO:
+                states.append(STATE_INDIFFERENT)
+            elif mask == MASK_NAN:
+                states.append(STATE_UNDEFINED)
+            else:
+                t = mask & rol(mask, 1)
+                states.append(bit_index(t if t != 0 else mask))
+        return torch.tensor(states, dtype=torch.long, device=device)
+
     def bit_index_u16(m: torch.Tensor) -> torch.Tensor:
         """Vectorized index of highest set bit in uint16 mask."""
-        k = torch.zeros_like(m, dtype=torch.long)
-        for b in range(1, 16):
-            k = torch.where((m >> b) != 0, b, k)
-        return k
+        return _bit_index_table(m.device)[m.to(torch.long) & 0xFFFF]
 
     def is_one_hot_u16(m: torch.Tensor) -> torch.Tensor:
         """Vectorized one-hot check for uint16 mask."""
@@ -633,20 +665,11 @@ if _HAS_TORCH:
 
     def even_anchor_u16(m: torch.Tensor) -> torch.Tensor:
         """Vectorized representative bit extraction (unique even bit on boundaries)."""
-        one_hot = is_one_hot_u16(m)
-        even_k = torch.full_like(m, -1, dtype=torch.long)
-        for k in range(14, -1, -2):
-            even_k = torch.where((m & (1 << k)) != 0, k, even_k)
-        return torch.where(one_hot, bit_index_u16(m), even_k)
+        return _even_anchor_table(m.device)[m.to(torch.long) & 0xFFFF]
 
     def state_u16(m: torch.Tensor) -> torch.Tensor:
         """Vectorized canonical state in 0..17 from 16-bit mask."""
-        t = m & rol_u16(m, 1)
-        target = torch.where(t != 0, t, m)
-        s = bit_index_u16(target)
-        s = torch.where(m == MASK_ZERO, torch.full_like(s, STATE_INDIFFERENT), s)
-        s = torch.where(m == MASK_NAN, torch.full_like(s, STATE_UNDEFINED), s)
-        return s
+        return _state_table(m.device)[m.to(torch.long) & 0xFFFF]
 
     def on_bisector_d16(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         scale = torch.maximum(x, y)
