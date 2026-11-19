@@ -782,37 +782,41 @@ if _HAS_TORCH:
         rel: float = 0.25,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Vectorized encoding of (logic, emotion) into (x, y) in [0°, 22.5°] and u16 mask."""
+        abs_l = logic.abs()
+        abs_e = emotion.abs()
         if isinstance(eps, str):
             if eps != "auto":
                 raise ValueError(f"Unknown eps mode: {eps!r}")
             if rel <= 0.0:
-                threshold: Union[float, torch.Tensor] = 0.0
+                is_zero = torch.zeros((), dtype=torch.bool, device=logic.device)
             else:
                 rms = (logic.square() + emotion.square()).mean(dim=-1, keepdim=True).sqrt()
-                threshold = rms * rel
+                is_zero = (abs_l + abs_e) <= (rms * rel)
+        elif isinstance(eps, (int, float)) and eps == 0.0:
+            is_zero = torch.zeros((), dtype=torch.bool, device=logic.device)
         else:
-            threshold = eps
-        is_zero = (logic.abs() + emotion.abs()) <= threshold
+            is_zero = (abs_l + abs_e) <= eps
 
         q0 = (logic > 0.0) & (emotion >= 0.0)
         q1 = (logic <= 0.0) & (emotion > 0.0)
         q2 = (logic < 0.0) & (emotion <= 0.0)
 
-        q = torch.where(q0, 0, torch.where(q1, 1, torch.where(q2, 2, 3)))
-        u = torch.where(q0, logic, torch.where(q1, emotion, torch.where(q2, -logic, -emotion)))
-        v = torch.where(q0, emotion, torch.where(q1, -logic, torch.where(q2, -emotion, logic)))
+        odd_oct = torch.where(q0 | q2, abs_e >= abs_l, abs_l >= abs_e)
+        wx = torch.maximum(abs_l, abs_e)
+        wy = torch.minimum(abs_l, abs_e)
 
-        odd_oct = v >= u
-        wx = torch.where(odd_oct, v, u)
-        wy = torch.where(odd_oct, u, v)
-
-        near_diag = above_bisector_d16(wx, wy)
-        x = torch.where(near_diag, rotated_sum_d16(wx, wy), wx)
+        valid = (wx > 0.0) & torch.isfinite(wx)
+        safe_wx = torch.where(valid, wx, 1.0)
+        ny = wy / safe_wx
+        near_diag = valid & ((1.0 - ny) < (SQRT2 * ny - EPS_BOUND))
+        x = torch.where(near_diag, safe_wx * ((1.0 + ny) * INV_SQRT2), wx)
         y = torch.where(near_diag, (wx - wy) * INV_SQRT2, wy)
 
-        s_axis = 4 * q + torch.where(odd_oct, 3, 0)
-        s_diag = 4 * q + torch.where(odd_oct, 2, 1)
-        s16 = torch.where(near_diag, s_diag, s_axis)
+        q = torch.full(wx.shape, 3, dtype=torch.int32, device=wx.device)
+        q.masked_fill_(q2, 2)
+        q.masked_fill_(q1, 1)
+        q.masked_fill_(q0, 0)
+        s16 = (q << 2).bitwise_or_((odd_oct.to(torch.int32) * 3) ^ near_diag.to(torch.int32))
 
         return d16_reduced_u16(x, y, s16, is_zero)
 
