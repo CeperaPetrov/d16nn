@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 import os
 from pathlib import Path
 import tempfile
-from typing import Protocol
+from typing import Any, Protocol
 
 import torch
 from torch import nn
@@ -21,7 +21,7 @@ class CheckpointOptimizer(Protocol):
 class TrainingState:
     """Progress at an optimizer-step boundary.
 
-    ``epoch`` starts at one, ``batch`` counts completed batches in this epoch,
+    ``epoch`` starts at one, ``batch`` counts completed optimizer steps in this epoch,
     and ``step`` counts completed updates across all epochs. ``totals`` stores
     the token-weighted metric sums for the current epoch.
     """
@@ -36,8 +36,21 @@ class TrainingState:
     baseline: dict[str, float | int] | None = None
 
 
+def _detach_to_cpu(obj: Any) -> Any:
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().contiguous()
+    if isinstance(obj, dict):
+        return {k: _detach_to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_detach_to_cpu(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_detach_to_cpu(v) for v in obj)
+    return obj
+
+
 def _atomic_save(path: Path, payload: dict) -> None:
     path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="wb", prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False
     ) as stream:
@@ -54,6 +67,20 @@ def _atomic_save(path: Path, payload: dict) -> None:
             raise
 
 
+def _build_d16_config_dict(model: nn.Module, config: dict) -> dict:
+    """Build a `load_d16_checkpoint`-compatible `d16_config` dictionary."""
+    d16_cfg = dict(config)
+    model_cfg = getattr(model, "config", None)
+    if model_cfg is not None and hasattr(model_cfg, "complex_hidden_size") and hasattr(model_cfg, "hidden_size"):
+        d16_cfg["is_1to1_import"] = bool(model_cfg.complex_hidden_size == model_cfg.hidden_size)
+    else:
+        d16_cfg.setdefault("is_1to1_import", False)
+    first_param = next(model.parameters(), None)
+    if first_param is not None:
+        d16_cfg["dtype"] = str(first_param.dtype).replace("torch.", "")
+    return d16_cfg
+
+
 def save_training_checkpoint(
     path: Path,
     model: nn.Module,
@@ -68,16 +95,20 @@ def save_training_checkpoint(
         "format_version": 1,
         "metadata": metadata,
         "training_state": asdict(state),
-        "state_dict": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
+        "state_dict": _detach_to_cpu(model.state_dict()),
+        "optimizer": _detach_to_cpu(optimizer.state_dict()),
         "cpu_rng": torch.get_rng_state(),
         "cuda_rng": cuda_rng,
     })
 
 
 def read_training_metadata(path: Path) -> dict:
-    """Identify the storage and optimizer before constructing the model."""
-    payload = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+    """Identify the configuration and optimizer before constructing the model.
+
+    Avoids `mmap=True` so Windows does not retain an open file handle when
+    `_atomic_save` later replaces `latest.pt`.
+    """
+    payload = torch.load(path, map_location="cpu", weights_only=True)
     if payload.get("format_version") != 1:
         raise ValueError(f"Unsupported training checkpoint format in {path}")
     return payload["metadata"]
@@ -119,12 +150,13 @@ def save_inference_checkpoint(
     step: int,
     validation: dict[str, float | int],
     teacher_revision: str | None = None,
-    weight_storage: str = "cartesian",
+    weight_storage: str = "d16",
 ) -> None:
-    """Save weights, storage format, and validation metrics."""
+    """Save weights, config (also compatible with `load_d16_checkpoint`), and validation metrics."""
     _atomic_save(path, {
         "config": config,
-        "state_dict": model.state_dict(),
+        "d16_config": _build_d16_config_dict(model, config),
+        "state_dict": _detach_to_cpu(model.state_dict()),
         "epoch": epoch,
         "step": step,
         "validation": validation,

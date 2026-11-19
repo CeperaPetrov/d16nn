@@ -18,7 +18,7 @@ IndiffThreshold = float | Literal["auto"]
 class _Moments:
     step: int
     first: D16ComplexTensor
-    second: D16ComplexTensor
+    second: torch.Tensor
 
 
 def _accumulation_dtype(value: torch.Tensor) -> torch.dtype:
@@ -28,7 +28,7 @@ def _accumulation_dtype(value: torch.Tensor) -> torch.dtype:
 def _new_moments(parameter: D16Parameter) -> _Moments:
     dtype = _accumulation_dtype(parameter.x)
     first = D16ComplexTensor.zeros_like(parameter.value(), dtype=dtype)
-    second = D16ComplexTensor.zeros_like(parameter.value(), dtype=dtype)
+    second = torch.zeros_like(parameter.x, dtype=dtype)
     return _Moments(0, first, second)
 
 
@@ -36,7 +36,8 @@ class D16AdamW:
     """AdamW operating purely through D16ComplexTensor arithmetic (+, -, *).
 
     First moments are complex D16ComplexTensor objects accumulated via D16 addition.
-    Second moments are nonnegative D16ComplexTensor objects accumulated via D16 addition.
+    Second moments are nonnegative real torch.Tensor buffers accumulated from
+    gradient.norm_squared() (preserving D16 NaN masks).
     Weight updates and decay are executed via D16 multiplication and subtraction,
     automatically updating sector masks inside D16ComplexTensor.
 
@@ -169,16 +170,17 @@ class D16AdamW:
             prev_first = moments.first[index]
             prev_second = moments.second[index]
 
-            # Pure D16ComplexTensor arithmetic:
+            # First moment uses D16ComplexTensor arithmetic; second moment is a real scalar EMA:
             first = prev_first * beta1 + gradient * (1.0 - beta1)
-            second = prev_second * beta2 + gradient.norm_squared_d16() * (1.0 - beta2)
-            denom = (second.x / correction2).sqrt() + self.eps
+            grad_norm_sq = gradient.norm_squared().masked_fill(gradient.is_nan(), float("nan"))
+            second = prev_second * beta2 + grad_norm_sq * (1.0 - beta2)
+            denom = (second / correction2).sqrt() + self.eps
             delta = first * (step_size / denom)
             updated = weight * decay - delta
 
             parameter.copy_(updated.round_to_dtype(stored_weight.dtype), index=index)
             moments.first.copy_slice_(index, first)
-            moments.second.copy_slice_(index, second)
+            moments.second[index].copy_(second)
 
         if self._should_apply_indiff_threshold(parameter):
             parameter.copy_(
@@ -205,7 +207,7 @@ class D16AdamW:
                     "first_x": item.first.x,
                     "first_y": item.first.y,
                     "first_rotation": item.first.rotation,
-                    "second_radius": item.second.x,
+                    "second_radius": item.second,
                 }
                 for item in self._moments
             ],
@@ -225,9 +227,8 @@ class D16AdamW:
             device, dtype = parameter.x.device, _accumulation_dtype(parameter.x)
             first = D16ComplexTensor(
                 entry["first_x"], entry["first_y"], entry["first_rotation"]
-            ).storage_copy(device=device, dtype=dtype)
-            second_r = entry["second_radius"].to(device=device, dtype=dtype)
-            second = D16ComplexTensor.from_real(second_r).clone()
+            ).storage_copy(device=device, dtype=dtype)            
+            second = entry["second_radius"].detach().to(device=device, dtype=dtype).clone()
             restored.append(_Moments(entry["step"], first, second))
         self._set_options(
             state_dict["lr"],
