@@ -700,36 +700,44 @@ if _HAS_TORCH:
         res = safe_scale * (((a / safe_scale) + (b / safe_scale)) * INV_SQRT2)
         return torch.where(nonzero, res, torch.zeros_like(a))
 
+    @lru_cache(maxsize=None)
+    def _reduced_mask_table(device: torch.device) -> torch.Tensor:
+        """48-entry int32 table: [0..15] interior, [16..31] y=0 boundary, [32..47] 22.5° bisector."""
+        if device.type != "cpu":
+            return _reduced_mask_table(torch.device("cpu")).to(device)
+        interior = [1 << k for k in range(16)]
+        on_y0 = [
+            (1 << k) | (1 << (((k + 1) if (k & 1) else (k + 15)) & 15))
+            for k in range(16)
+        ]
+        on_bis = [
+            (1 << k) | (1 << (((k + 15) if (k & 1) else (k + 1)) & 15))
+            for k in range(16)
+        ]
+        return torch.tensor(interior + on_y0 + on_bis, dtype=torch.int32, device=device)
+
     def d16_reduced_u16(
         x: torch.Tensor,
         y: torch.Tensor,
         k_counter: torch.Tensor,
         is_zero: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        non_finite = (~torch.isfinite(x)) | (~torch.isfinite(y))
-        z_mask = (~non_finite) & (is_zero | ((x == 0.0) & (y == 0.0)))
-        k = k_counter & 15
-        mask = (1 << k) & 0xFFFF
+        finite = torch.isfinite(x) & torch.isfinite(y)
+        z_mask = finite & (is_zero | ((x == 0.0) & (y == 0.0)))
+        active = finite & (~z_mask)
+        zero_out = ~active
 
-        is_odd = (k & 1) != 0
-        nb_y0 = torch.where(is_odd, (k + 1) & 15, (k + 15) & 15)
-        nb_bis = torch.where(is_odd, (k + 15) & 15, (k + 1) & 15)
-
-        active = (~non_finite) & (~z_mask)
         on_y0 = active & (y <= EPS_BOUND * x)
         on_bis = active & (~on_y0) & on_bisector_d16(x, y)
 
-        mask = torch.where(on_y0, mask | (1 << nb_y0), mask)
-        mask = torch.where(on_bis, mask | (1 << nb_bis), mask)
-        mask = torch.where(z_mask, torch.full_like(mask, MASK_ZERO), mask)
-        mask = torch.where(non_finite, torch.zeros_like(mask), mask)
+        idx = torch.add(k_counter.to(torch.int32) & 15, on_y0, alpha=16)
+        idx.add_(on_bis, alpha=32)
+        mask = _reduced_mask_table(x.device)[idx]
+        mask.masked_fill_(z_mask, MASK_ZERO)
+        mask.masked_fill_(~finite, MASK_NAN)
 
-        ox = torch.where(z_mask | non_finite, torch.zeros_like(x), x)
-        oy = torch.where(
-            z_mask | non_finite | on_y0,
-            torch.zeros_like(y),
-            torch.where(on_bis, ox * TAN_PI_8, y),
-        )
+        ox = x.masked_fill(zero_out, 0.0)
+        oy = torch.where(on_bis, ox * TAN_PI_8, y).masked_fill(zero_out | on_y0, 0.0)
         return ox, oy, mask
 
     def d16_make_u16(
