@@ -612,13 +612,19 @@ if _HAS_TORCH:
         """Vectorized 16-bit circular shift right."""
         return rol_u16(m, (16 - (n & 15)) & 15)
 
+    @lru_cache(maxsize=None)
+    def _reverse_bits_table(device: torch.device) -> torch.Tensor:
+        if device.type != "cpu":
+            return _reverse_bits_table(torch.device("cpu")).to(device)
+        return torch.tensor(
+            [reverse_bits(mask) for mask in range(1 << 16)],
+            dtype=torch.int32,
+            device=device,
+        )
+
     def reverse_bits_u16(m: torch.Tensor) -> torch.Tensor:
         """Vectorized 16-bit bit reversal."""
-        m = ((m & 0xFF00) >> 8) | ((m & 0x00FF) << 8)
-        m = ((m & 0xF0F0) >> 4) | ((m & 0x0F0F) << 4)
-        m = ((m & 0xCCCC) >> 2) | ((m & 0x3333) << 2)
-        m = ((m & 0xAAAA) >> 1) | ((m & 0x5555) << 1)
-        return m & 0xFFFF
+        return _reverse_bits_table(m.device)[m.to(torch.long) & 0xFFFF].to(m.dtype)
 
     @lru_cache(maxsize=None)
     def _bit_index_table(device: torch.device) -> torch.Tensor:
