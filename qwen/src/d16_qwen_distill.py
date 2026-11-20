@@ -135,6 +135,21 @@ def _load_teacher_model(
     return teacher.to(device).eval().requires_grad_(False)
 
 
+def _load_student_init_weights(checkpoint_path: Path, student: D16QwenForCausalLM) -> None:
+    """Load only model weights from a saved inference or training checkpoint (fresh optimizer/schedule)."""
+    payload = torch.load(checkpoint_path.expanduser(), map_location="cpu", weights_only=False)
+    if isinstance(payload, dict):
+        for key in ("model_state_dict", "state_dict", "model", "student"):
+            if key in payload and isinstance(payload[key], dict):
+                state_dict = payload[key]
+                break
+        else:
+            state_dict = payload
+    else:
+        raise ValueError(f"Unsupported checkpoint format in {checkpoint_path}")
+    student.load_state_dict(state_dict, strict=True)
+
+
 def _scheduled_lr(
     step: int,
     total_steps: int,
@@ -285,6 +300,7 @@ def parse_args() -> argparse.Namespace:
     # Checkpointing & control
     parser.add_argument("--checkpoint-every", type=int, default=100, help="Save resumable state every N updates")
     parser.add_argument("--evaluate-every", type=int, default=250, help="Validate every N updates and at each epoch end")
+    parser.add_argument("--init-from", type=Path, default=None, help="Initialize student weights from checkpoint (e.g. best.pt) with fresh optimizer/LR")
     parser.add_argument("--resume", action="store_true", help="Restore an existing run from latest.pt")
     parser.add_argument("--stop-after-step", type=int, help="Save and pause after this absolute optimizer step")
 
@@ -311,6 +327,11 @@ def parse_args() -> argparse.Namespace:
         parser.error("distillation weight must be between zero and one")
     if not 0 < args.learning_rate < math.inf or not 0 < args.temperature < math.inf:
         parser.error("learning rate and temperature must be positive and finite")
+    if args.init_from is not None:
+        if args.resume:
+            parser.error("cannot combine --init-from with --resume")
+        if not args.init_from.expanduser().is_file():
+            parser.error(f"init-from checkpoint not found: {args.init_from}")
     if not args.train_text.expanduser().is_file():
         parser.error(f"train-text file not found: {args.train_text}")
     if not args.validation_text.expanduser().is_file():
@@ -646,7 +667,11 @@ def train(args: argparse.Namespace) -> None:
         )
 
         config = student_config(teacher.config, args)
-        student = D16QwenForCausalLM(config).to(device=student_device, dtype=student_dtype)
+        student = D16QwenForCausalLM(config)
+        if args.init_from is not None:
+            _load_student_init_weights(args.init_from, student)
+            write_event(log, "init_from", checkpoint=str(args.init_from))
+        student = student.to(device=student_device, dtype=student_dtype)
         student.gradient_checkpointing_enable()
 
         optimizer = D16AdamW(
