@@ -483,31 +483,48 @@ def evaluate(
     teacher_device: torch.device,
 ) -> dict[str, float | int]:
     student.eval()
+    prev_collect = student.config.collect_d16_stats
+    student.set_collect_d16_stats(True, reset=True)
     totals = {"student_nll": 0.0, "student_sampling_nll": 0.0, "teacher_nll": 0.0, "distillation_kl": 0.0}
     token_count = 0
-    for block in blocks.split(args.batch_size):
-        ce, kl, teacher_nll, sampling_nll = batch_losses(
-            student,
-            teacher,
-            block,
-            teacher_device=teacher_device,
-            student_device=student_device,
-            temperature=args.temperature,
-            top_k=args.distill_top_k,
-            compute_teacher_nll=True,
-        )
-        n_tok = int(block.shape[0] * (block.shape[1] - 1))
-        ce_val = float(ce.x.masked_fill(ce.is_nan(), float("nan")).item())
-        kl_val = float(kl.x.masked_fill(kl.is_nan(), float("nan")).item())
-        totals["student_nll"] += ce_val * n_tok
-        totals["student_sampling_nll"] += float(sampling_nll) * n_tok
-        totals["teacher_nll"] += float(teacher_nll) * n_tok
-        totals["distillation_kl"] += kl_val * n_tok
-        token_count += n_tok
+    try:
+        for block in blocks.split(args.batch_size):
+            ce, kl, teacher_nll, sampling_nll = batch_losses(
+                student,
+                teacher,
+                block,
+                teacher_device=teacher_device,
+                student_device=student_device,
+                temperature=args.temperature,
+                top_k=args.distill_top_k,
+                compute_teacher_nll=True,
+            )
+            n_tok = int(block.shape[0] * (block.shape[1] - 1))
+            ce_val = float(ce.x.masked_fill(ce.is_nan(), float("nan")).item())
+            kl_val = float(kl.x.masked_fill(kl.is_nan(), float("nan")).item())
+            totals["student_nll"] += ce_val * n_tok
+            totals["student_sampling_nll"] += float(sampling_nll) * n_tok
+            totals["teacher_nll"] += float(teacher_nll) * n_tok
+            totals["distillation_kl"] += kl_val * n_tok
+            token_count += n_tok
+
+        act_summary = student.get_d16_state_summary()
+    finally:
+        student.set_collect_d16_stats(prev_collect, reset=True)
+
+    weight_zero = 0
+    weight_total = 0
+    for param in student.d16_parameters():
+        if param.x.ndim >= 2:
+            val = param.value()
+            weight_zero += int(val.is_zero().sum().item())
+            weight_total += val.numel()
 
     metrics: dict[str, float | int] = {name: total / token_count for name, total in totals.items()}
     metrics["student_perplexity"] = _safe_perplexity(float(metrics["student_sampling_nll"]))
     metrics["teacher_perplexity"] = _safe_perplexity(float(metrics["teacher_nll"]))
+    metrics["act_indiff_pct"] = float(act_summary["indifferent_pct"])
+    metrics["weight_indiff_pct"] = (weight_zero / max(weight_total, 1)) * 100.0
     metrics["tokens"] = token_count
     return metrics
 
@@ -564,8 +581,7 @@ def _update_accumulated(
         obj_acc += vals[2] * weight
         del ce, kl, objective
 
-    grad_norm = float(optimizer.step(max_grad_norm=1.0).item())
-    optimizer.zero_grad(set_to_none=True)
+    grad_norm = float(optimizer.step(max_grad_norm=1.0, release_grads=True).item())
     return {
         "lr": cur_lr,
         "student_nll": ce_acc,
