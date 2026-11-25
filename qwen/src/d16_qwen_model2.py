@@ -219,7 +219,7 @@ class D16RotaryEmbedding(nn.Module):
         dtype = torch.float64 if hidden_states.dtype == torch.float64 else torch.float32
         inverse_frequencies = self.base ** (-self.frequency_indices.to(dtype) / self.head_dim)
         phase = position_ids.to(dtype).unsqueeze(-1) * inverse_frequencies
-        return D16ComplexTensor.pack(phase.cos(), phase.sin()).to(hidden_states.dtype)
+        return D16ComplexTensor.from_phase(phase).to(hidden_states.dtype)
 
 
 class D16QwenAttention(nn.Module):
