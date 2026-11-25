@@ -36,20 +36,38 @@ from d16_vis_utils import relative_weight_shift
 class TestD16Phase(unittest.TestCase):
     def test_rotary_embedding_uses_direct_rotors_on_both_frequency_grids(self) -> None:
         rope = D16RotaryEmbedding(head_dim=64)
-        ids = torch.tensor([[0, 1, 1065, 32767]])
-        hidden = D16ComplexTensor.ones((), dtype=torch.bfloat16)
+        ids = torch.tensor([[0, 1, 17, 49, 66, 1065]])
+        hidden_f64 = D16ComplexTensor.ones((), dtype=torch.float64)
+        hidden_bf16 = D16ComplexTensor.ones((), dtype=torch.bfloat16)
         for half_head in (False, True):
             with self.subTest(half_head=half_head):
                 if half_head:
                     rope.use_qwen_half_head_frequencies()
-                phase = ids.float().unsqueeze(-1) * rope.base ** (-rope.frequency_indices.float() / 64)
-                expected = D16ComplexTensor.pack(phase.cos(), phase.sin()).to(hidden.dtype)
+                s = 0.125 * (rope.base ** (-rope.frequency_indices.double() / 64))
+                expected_step = D16ComplexTensor.from_cayley(s).square().square()
                 with patch.object(D16ComplexTensor, "pack", side_effect=AssertionError("RoPE called pack")):
-                    actual = rope(hidden, ids)
-                self.assertEqual(actual.dtype, hidden.dtype)
-                self.assertTrue(torch.equal(actual.rotation, expected.rotation))
-                for got, ref in zip(actual.unpack(), expected.unpack()):
-                    torch.testing.assert_close(got, ref)
+                    actual_f64 = rope(hidden_f64, ids)
+                    actual_bf16 = rope(hidden_bf16, ids)
+                self.assertEqual(actual_bf16.dtype, torch.bfloat16)
+                # Позиция 0 == 1, позиция 1 == алгебраическому Кэли-шагу, норма == 1:
+                torch.testing.assert_close(actual_f64.norm_squared(), torch.ones_like(actual_f64.x), atol=1e-13, rtol=0)
+                torch.testing.assert_close(actual_f64[:, 1].x[0], expected_step.x, atol=1e-13, rtol=0)
+                torch.testing.assert_close(actual_f64[:, 1].y[0], expected_step.y, atol=1e-13, rtol=0)
+                self.assertTrue(torch.equal(actual_f64[:, 1].rotation[0], expected_step.rotation))
+                # Групповой закон R(17) * R(49) == R(66):
+                prod = actual_f64[:, 2] * actual_f64[:, 3]
+                target = actual_f64[:, 4]
+                torch.testing.assert_close(prod.x, target.x, atol=1e-13, rtol=0)
+                torch.testing.assert_close(prod.y, target.y, atol=1e-13, rtol=0)
+                self.assertTrue(torch.equal(prod.rotation, target.rotation))
+                if half_head:
+                    self.assertTrue(torch.equal(actual_f64.x[..., :32], actual_f64.x[..., 32:]))
+                    self.assertTrue(torch.equal(actual_f64.rotation[..., :32], actual_f64.rotation[..., 32:]))
+        # Отрицательные позиции отклоняются, а .cpu() очищает кэш:
+        with self.assertRaisesRegex(ValueError, "nonnegative"):
+            rope(hidden_f64, torch.tensor([[-1]]))
+        rope.cpu()
+        self.assertIsNone(rope._rotor_table)
 
     def test_from_phase_preserves_sectors_and_long_context_rope_angles(self) -> None:
         for dtype in (torch.float32, torch.float64):

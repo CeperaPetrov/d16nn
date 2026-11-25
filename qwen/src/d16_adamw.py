@@ -192,14 +192,14 @@ class D16AdamW:
                 rounded = rounded.apply_Manifold_Threshold_L1(self.indiff_eps, rel=self.indiff_rel, dim=None)
             elif auto_indiff:
                 assert sq_sum is not None
-                sq_sum += rounded.norm_squared().sum(dtype=torch.float64)
+                sq_sum += rounded.to(dtype).norm_squared().sum(dtype=torch.float64)
 
             parameter.copy_(rounded, index=index)
             moments.first.copy_slice_(index, first)
 
         if auto_indiff:
             assert sq_sum is not None
-            threshold = (sq_sum / max(parameter.x.numel(), 1)).sqrt().to(parameter.x.dtype) * self.indiff_rel
+            threshold = (sq_sum / max(parameter.x.numel(), 1)).sqrt() * self.indiff_rel
             weights = parameter.value()
             for index in self._tiles(parameter):
                 parameter.copy_(weights[index].apply_Manifold_Threshold_L1(threshold, dim=None), index=index)

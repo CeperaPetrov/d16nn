@@ -226,10 +226,28 @@ class D16RotaryEmbedding(nn.Module):
         self.register_buffer("frequency_indices", torch.arange(head_dim))
         self._rotor_table: Optional[D16ComplexTensor] = None
         self._next_power: Optional[D16ComplexTensor] = None
+        self._cache_meta: Optional[
+            tuple[torch.Tensor, Optional[int], Optional[torch.Tensor], float, torch.device]
+        ] = None
 
     def _invalidate_cache(self) -> None:
         self._rotor_table = None
         self._next_power = None
+        self._cache_meta = None
+
+    def _apply(self, fn, *args, **kwargs):
+        self._invalidate_cache()
+        return super()._apply(fn, *args, **kwargs)
+
+    def _is_cache_valid(self, device: torch.device) -> bool:
+        if self._rotor_table is None or self._cache_meta is None:
+            return False
+        freq_ref, cached_ver, freq_snap, cached_base, cached_dev = self._cache_meta
+        if cached_dev != device or cached_base != self.base or freq_ref is not self.frequency_indices:
+            return False
+        if cached_ver is not None:
+            return self.frequency_indices._version == cached_ver
+        return freq_snap is not None and torch.equal(self.frequency_indices, freq_snap)
 
     def use_qwen_half_head_frequencies(self) -> None:
         """Give corresponding channels in the two halves of a Qwen head the same frequency."""
@@ -244,6 +262,62 @@ class D16RotaryEmbedding(nn.Module):
             state_dict.setdefault(prefix + "frequency_indices", self.frequency_indices)
         super()._load_from_state_dict(state_dict, prefix, local_metadata, *args)
         self._invalidate_cache()
+
+    @torch.no_grad()
+    def _build_step_rotor(self, device: torch.device) -> D16ComplexTensor:
+        r = _algebraic_inv_root(self.base, self.head_dim)
+        indices = self.frequency_indices.tolist()
+        max_idx = max(indices, default=0)
+        # s_k = (1/8) * r^k in (0, 0.125] < tan(pi/16), strictly inside Sector 0.
+        ladder = [0.125]
+        for _ in range(max_idx):
+            ladder.append(ladder[-1] * r)
+        s = torch.tensor([ladder[i] for i in indices], dtype=torch.float64, device=device)
+        return D16ComplexTensor.from_cayley(s).square().square()
+
+    @torch.no_grad()
+    def _ensure_table(self, required_length: int, device: torch.device) -> D16ComplexTensor:
+        if not self._is_cache_valid(device):
+            self._rotor_table = D16ComplexTensor.ones(
+                (1, self.head_dim), dtype=torch.float64, device=device
+            )
+            self._next_power = self._build_step_rotor(device).map_tensors(
+                lambda t: t.unsqueeze(0)
+            )
+            freq = self.frequency_indices
+            if freq.is_inference():
+                self._cache_meta = (freq, None, freq.clone(), self.base, device)
+            else:
+                self._cache_meta = (freq, freq._version, None, self.base, device)
+        table = self._rotor_table
+        power = self._next_power
+        assert table is not None and power is not None
+        while table.shape[0] < required_length:
+            table = D16ComplexTensor.cat((table, table * power), dim=0)
+            power = power.square()
+        self._rotor_table = table
+        self._next_power = power
+        return table
+
+    def forward(
+        self,
+        hidden_states: D16ComplexTensor,
+        position_ids: torch.Tensor,
+        *,
+        max_position: Optional[int] = None,
+    ) -> D16ComplexTensor:
+        if max_position is None:
+            if position_ids.numel():
+                min_pos, max_pos = torch.aminmax(position_ids)
+                if int(min_pos.item()) < 0:
+                    raise ValueError("position_ids must be nonnegative")
+                max_position = int(max_pos.item())
+            else:
+                max_position = 0
+        elif max_position < 0:
+            raise ValueError("max_position must be nonnegative")
+        table = self._ensure_table(max_position + 1, hidden_states.device)
+        return table[position_ids].to(hidden_states.dtype)
 
     @torch.no_grad()
     def _build_step_rotor(self, device: torch.device) -> D16ComplexTensor:

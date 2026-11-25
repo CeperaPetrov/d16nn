@@ -1320,6 +1320,17 @@ if _HAS_TORCH:
             if not phase.is_floating_point():
                 raise TypeError("phase must be a real floating-point tensor in radians")
             return cls(*_FromPhase.apply(phase))
+        
+        @classmethod
+        def from_cayley(cls, tangent: torch.Tensor) -> "D16ComplexTensor":
+            """Construct canonical unit rotors via rational Cayley map (1 - t^2 + 2it) / (1 + t^2)."""
+            if not tangent.is_floating_point():
+                raise TypeError("tangent must be a real floating-point tensor")
+            t = tangent.double()
+            t2 = t * t
+            inv = (1.0 + t2).reciprocal()
+            x, y, mask = d16_from_xy_u16((1.0 - t2) * inv, (2.0 * t) * inv)
+            return cls(x.to(tangent.dtype), y.to(tangent.dtype), mask)
 
         @classmethod
         def from_real(cls, value: Union[float, int, torch.Tensor]) -> "D16ComplexTensor":
@@ -1553,17 +1564,27 @@ if _HAS_TORCH:
                     raise ValueError(f"Unknown manifold threshold mode: {eps!r}")
                 if rel <= 0.0:
                     return self
-                msq = self.norm_squared()
-                rms = msq.mean(dim=dim, keepdim=True).sqrt() if dim is not None else msq.mean().sqrt()
+            elif isinstance(eps, (int, float)) and eps <= 0.0:
+                return self
+
+            calc_dtype = torch.float64 if self.dtype == torch.float64 else torch.float32
+            x = self.x.to(calc_dtype)
+            y = self.y.to(calc_dtype)
+
+            if isinstance(eps, str):
+                msq = x.square() + y.square()
+                if dim is not None:
+                    rms = msq.mean(dim=dim, keepdim=True, dtype=torch.float64).sqrt()
+                else:
+                    rms = msq.mean(dtype=torch.float64).sqrt()
                 threshold: Union[float, torch.Tensor] = rms * rel
             elif isinstance(eps, (int, float)):
-                if eps <= 0.0:
-                    return self
                 threshold = float(eps)
             else:
                 threshold = eps
+
             turns, _ = _chart_parameters(self.rotation)
-            l1 = torch.where((turns & 1) != 0, self.x * SQRT2, self.x + self.y)
+            l1 = torch.where((turns & 1) != 0, x * SQRT2, x + y)
             return self.to_indifferent_where((l1 <= threshold) & ~self.is_nan())
 
         # --- Dihedral & Algebraic Operations (Autograd-Enabled) ---
