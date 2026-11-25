@@ -77,7 +77,7 @@ class D16QwenConfig:
 
     indiff_eps: IndiffThreshold = 0.0
     indiff_rel: float = 0.25
-    mlp_activation: MLPActivation = "sigmoid"
+    mlp_activation: MLPActivation = "bilinear"
     collect_d16_stats: bool = False
 
     @property
@@ -285,8 +285,8 @@ class D16QwenAttention(nn.Module):
 
 class D16QwenMLP(nn.Module):
     """Wedge-native D16 MLP supporting:
-    - Variant 1 (default, 'sigmoid'): z.activate('sigmoid')  [executes z * z.sigmoid()]
-    - Variant 2 ('bilinear'): z * g  with up_proj and gate_proj
+    - Variant 1 ('sigmoid'): z.activate('sigmoid')  [executes z * z.sigmoid()]
+    - Variant 2 (default, 'bilinear'): z * g  with up_proj and gate_proj
     - Variant 3 ('sum', 'rel', or callable): z.activate(mode) directly over wedge coordinates (x, y)
     """
 
