@@ -167,6 +167,10 @@ class D16AdamW:
         dtype = moments.first.dtype
         weights = parameter.value()
 
+        apply_indiff = self._should_apply_indiff_threshold(parameter)
+        auto_indiff = apply_indiff and self.indiff_eps == "auto"
+        sq_sum = torch.zeros((), dtype=torch.float64, device=parameter.x.device) if auto_indiff else None
+
         for index in self._tiles(parameter):
             stored_weight = weights[index]
             weight = stored_weight.to(dtype=dtype)
@@ -183,15 +187,22 @@ class D16AdamW:
             delta = first * step_scale
             updated = weight * decay - delta
 
-            parameter.copy_(updated.round_to_dtype(stored_weight.dtype), index=index)
+            rounded = updated.round_to_dtype(stored_weight.dtype)
+            if apply_indiff and not auto_indiff:
+                rounded = rounded.apply_Manifold_Threshold_L1(self.indiff_eps, rel=self.indiff_rel, dim=None)
+            elif auto_indiff:
+                assert sq_sum is not None
+                sq_sum += rounded.norm_squared().sum(dtype=torch.float64)
+
+            parameter.copy_(rounded, index=index)
             moments.first.copy_slice_(index, first)
 
-        if self._should_apply_indiff_threshold(parameter):
-            parameter.copy_(
-                parameter.value().apply_Manifold_Threshold_L1(
-                    self.indiff_eps, rel=self.indiff_rel, dim=None
-                )
-            )
+        if auto_indiff:
+            assert sq_sum is not None
+            threshold = (sq_sum / max(parameter.x.numel(), 1)).sqrt().to(parameter.x.dtype) * self.indiff_rel
+            weights = parameter.value()
+            for index in self._tiles(parameter):
+                parameter.copy_(weights[index].apply_Manifold_Threshold_L1(threshold, dim=None), index=index)
 
     def state_dict(self) -> dict:
         """Serialize optimizer moments using tensors and primitive metadata."""

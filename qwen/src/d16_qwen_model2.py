@@ -190,8 +190,32 @@ class D16RMSNorm(nn.Module):
         return (normed * self.gain.value().to(dtype)).to(hidden_states.dtype)
 
 
+def _algebraic_inv_root(base: float, n: int) -> float:
+    """Solve r**n = 1 / base using only +, -, *, / (monotone Newton from 1.0)."""
+    if base <= 0.0:
+        raise ValueError("base must be positive")
+    if base == 1.0 or n <= 0:
+        return 1.0
+    inv = base > 1.0
+    target = 1.0 / float(base) if inv else float(base)
+    r = 1.0
+    for _ in range(100):
+        p, b, e = 1.0, r, n - 1
+        while e > 0:
+            if e & 1:
+                p *= b
+            b *= b
+            e >>= 1
+        r_next = ((n - 1) * r + target / p) / n
+        if abs(r_next - r) <= 1e-16 * r:
+            r = r_next
+            break
+        r = r_next
+    return r if inv else (1.0 / r)
+
+
 class D16RotaryEmbedding(nn.Module):
-    """One D16 rotation per complex head channel."""
+    """Pure algebraic D16 rotary table: rational Cayley seed in Sector 0 + D16 doubling."""
 
     _version = 2  # Earlier state dicts kept the RoPE grid only in memory.
 
@@ -200,6 +224,12 @@ class D16RotaryEmbedding(nn.Module):
         self.head_dim = head_dim
         self.base = base
         self.register_buffer("frequency_indices", torch.arange(head_dim))
+        self._step_rotor: Optional[D16ComplexTensor] = None
+        self._rotor_table: Optional[D16ComplexTensor] = None
+
+    def _invalidate_cache(self) -> None:
+        self._step_rotor = None
+        self._rotor_table = None
 
     def use_qwen_half_head_frequencies(self) -> None:
         """Give corresponding channels in the two halves of a Qwen head the same frequency."""
@@ -207,19 +237,64 @@ class D16RotaryEmbedding(nn.Module):
             raise ValueError("Qwen half-head RoPE requires an even head_dim")
         even_indices = torch.arange(0, self.head_dim, 2, device=self.frequency_indices.device)
         self.frequency_indices.copy_(even_indices.repeat(2))
+        self._invalidate_cache()
 
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, *args):
         if local_metadata.get("version", 1) < 2:
             state_dict.setdefault(prefix + "frequency_indices", self.frequency_indices)
         super()._load_from_state_dict(state_dict, prefix, local_metadata, *args)
+        self._invalidate_cache()
+
+    @torch.no_grad()
+    def _build_step_rotor(self, device: torch.device) -> D16ComplexTensor:
+        r = _algebraic_inv_root(self.base, self.head_dim)
+        indices = self.frequency_indices.tolist()
+        max_idx = max(indices, default=0)
+        # s_k = (1/8) * r^k in (0, 0.125] < tan(pi/16), strictly inside Sector 0 (0x0001).
+        ladder = [0.125]
+        for _ in range(max_idx):
+            ladder.append(ladder[-1] * r)
+        s = torch.tensor([ladder[i] for i in indices], dtype=torch.float64, device=device)
+        s2 = s * s
+        inv = 1.0 / (1.0 + s2)
+        quarter = D16ComplexTensor(
+            (1.0 - s2) * inv,
+            (2.0 * s) * inv,
+            torch.ones(len(indices), dtype=torch.int32, device=device),
+        )
+        return quarter.square().square()
+
+    @torch.no_grad()
+    def _ensure_table(self, required_length: int, device: torch.device) -> D16ComplexTensor:
+        if self._step_rotor is None or self._step_rotor.device != device:
+            self._step_rotor = self._build_step_rotor(device)
+            self._rotor_table = D16ComplexTensor.ones(
+                (1, self.head_dim), dtype=torch.float64, device=device
+            )
+        table = self._rotor_table
+        assert table is not None and self._step_rotor is not None
+        if table.shape[0] < required_length:
+            table = D16ComplexTensor.ones((1, self.head_dim), dtype=torch.float64, device=device)
+            power = self._step_rotor.map_tensors(lambda t: t.unsqueeze(0))
+            while table.shape[0] < required_length:
+                need = min(table.shape[0], required_length - table.shape[0])
+                table = D16ComplexTensor.cat((table, table[:need] * power), dim=0)
+                if table.shape[0] < required_length:
+                    power = power.square()
+            self._rotor_table = table
+        return table
 
     def forward(
-        self, hidden_states: D16ComplexTensor, position_ids: torch.Tensor
+        self,
+        hidden_states: D16ComplexTensor,
+        position_ids: torch.Tensor,
+        *,
+        max_position: Optional[int] = None,
     ) -> D16ComplexTensor:
-        dtype = torch.float64 if hidden_states.dtype == torch.float64 else torch.float32
-        inverse_frequencies = self.base ** (-self.frequency_indices.to(dtype) / self.head_dim)
-        phase = position_ids.to(dtype).unsqueeze(-1) * inverse_frequencies
-        return D16ComplexTensor.from_phase(phase).to(hidden_states.dtype)
+        if max_position is None:
+            max_position = int(position_ids.max().item()) if position_ids.numel() else 0
+        table = self._ensure_table(max_position + 1, hidden_states.device)
+        return table[position_ids].to(hidden_states.dtype)
 
 
 class D16QwenAttention(nn.Module):
@@ -404,9 +479,11 @@ class D16QwenModel(nn.Module):
         past_length = past_key_values[0][0].shape[-2] if past_key_values is not None else 0
         total_length = past_length + length
         positions = torch.arange(past_length, total_length, device=device)
+        max_pos = None
         if position_ids is None:
             position_ids = positions.unsqueeze(0)
-        phases = self.rotary_emb(hidden_states, position_ids)
+            max_pos = max(total_length - 1, 0)
+        phases = self.rotary_emb(hidden_states, position_ids, max_position=max_pos)
         allowed = torch.arange(total_length, device=device) <= positions.unsqueeze(-1)
         allowed = allowed[None, None, :, :]
         if attention_mask is not None:

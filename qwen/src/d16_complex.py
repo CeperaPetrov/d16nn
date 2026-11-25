@@ -1047,6 +1047,12 @@ if _HAS_TORCH:
                 angle = angle.masked_scatter(large, angle.new_tensor(reduced))
             turns = (angle * (4 / math.pi)).round().masked_fill(~finite, 0)
             delta = (angle - turns * _PI_OVER_4_HI) - turns * _PI_OVER_4_LO
+            half_step = math.pi / 8
+            step = torch.where(
+                delta > half_step, 1.0, torch.where(delta < -half_step, -1.0, 0.0)
+            ).masked_fill(~finite, 0.0)
+            turns = turns + step
+            delta = (angle - turns * _PI_OVER_4_HI) - turns * _PI_OVER_4_LO
             sector = (2 * turns.to(torch.int32) - (delta < 0).int()) & 15
             x, y = _unit_wedge(delta.abs())
             x, y, mask = d16_reduced_u16(x, y, sector, angle.new_zeros((), dtype=torch.bool))
@@ -1541,8 +1547,9 @@ if _HAS_TORCH:
                 threshold = float(eps)
             else:
                 threshold = eps
-            re, im = self.unpack()
-            return self.to_indifferent_where(((re.abs() + im.abs()) <= threshold) & ~self.is_nan())
+            turns, _ = _chart_parameters(self.rotation)
+            l1 = torch.where((turns & 1) != 0, self.x * SQRT2, self.x + self.y)
+            return self.to_indifferent_where((l1 <= threshold) & ~self.is_nan())
 
         # --- Dihedral & Algebraic Operations (Autograd-Enabled) ---
 
@@ -1853,6 +1860,5 @@ __all__ = [
     "d16_to_xy_u16",
     "d16_multiply_u16",
     "apply_group_op_u16",
-    "apply_all_16_d16_ops_u16",
     "D16ComplexTensor",
 ]
