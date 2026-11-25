@@ -1003,6 +1003,21 @@ if _HAS_TORCH:
         y = cos * im - sin * re
         return cos * re + sin * im, torch.where(reflected, -y, y)
 
+    def _between_charts(
+        x: torch.Tensor,
+        y: torch.Tensor,
+        src_turns: torch.Tensor,
+        src_reflected: torch.Tensor,
+        dst_turns: torch.Tensor,
+        dst_reflected: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Transform local coordinates directly from one D16 chart into another."""
+        cos, sin = _rotation_basis((src_turns - dst_turns) & 7, x.dtype)
+        y_oriented = torch.where(src_reflected, -y, y)
+        nx = cos * x - sin * y_oriented
+        ny = sin * x + cos * y_oriented
+        return nx, torch.where(dst_reflected, -ny, ny)
+    
     def _compose_chart_mask(
         local_mask: torch.Tensor, turns: torch.Tensor, reflected: torch.Tensor
     ) -> torch.Tensor:
@@ -1124,11 +1139,9 @@ if _HAS_TORCH:
         def forward(ctx, ax, ay, ar, bx, by, br):
             a_turns, a_reflected = _chart_parameters(ar)
             b_turns, b_reflected = _chart_parameters(br)
-            cos, sin = _rotation_basis((b_turns - a_turns) & 7, bx.dtype)
-            by_oriented = torch.where(b_reflected, -by, by)
-            bx_in_a = cos * bx - sin * by_oriented
-            by_in_a = sin * bx + cos * by_oriented
-            by_in_a = torch.where(a_reflected, -by_in_a, by_in_a)
+            bx_in_a, by_in_a = _between_charts(
+                bx, by, b_turns, b_reflected, a_turns, a_reflected
+            )
             lx, ly, lrot = d16_from_xy_u16(ax + bx_in_a, ay + by_in_a)
 
             rotation = _compose_chart_mask(lrot, a_turns, a_reflected)
@@ -1145,11 +1158,14 @@ if _HAS_TORCH:
         @staticmethod
         def backward(ctx, grad_x, grad_y, _grad_rotation):
             ar, br, rotation = ctx.saved_tensors
-            grad_re, grad_im = _from_chart(grad_x, grad_y, rotation)
+            rot_turns, rot_reflected = _chart_parameters(rotation)
             undefined = rotation == MASK_NAN
 
             def operand_gradient(mask):
-                local_x, local_y = _into_chart(grad_re, grad_im, mask)
+                op_turns, op_reflected = _chart_parameters(mask)
+                local_x, local_y = _between_charts(
+                    grad_x, grad_y, rot_turns, rot_reflected, op_turns, op_reflected
+                )
                 return (
                     local_x.masked_fill(undefined, 0).sum_to_size(mask.shape),
                     local_y.masked_fill(undefined, 0).sum_to_size(mask.shape),
