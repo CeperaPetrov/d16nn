@@ -49,7 +49,7 @@ class D16QwenImportConfig(D16QwenConfig):
     match the reference Qwen dimensions 1-to-1 without modifying `d16_qwen_model2.py`.
     """
 
-    mlp_activation: MLPActivation = "gate"
+    mlp_activation: MLPActivation = "bilinear"
 
     @property
     def complex_hidden_size(self) -> int:
@@ -67,7 +67,7 @@ class D16QwenImportConfig(D16QwenConfig):
         num_hidden_layers: Optional[int] = None,
         indiff_eps: IndiffThreshold = 0.0,
         indiff_rel: float = 0.25,
-        mlp_activation: MLPActivation = "gate",
+        mlp_activation: MLPActivation = "bilinear",
         collect_d16_stats: bool = False,
     ) -> "D16QwenImportConfig":
         """Build a 1-to-1 D16QwenImportConfig from a HuggingFace Qwen config dict or object."""
@@ -76,6 +76,8 @@ class D16QwenImportConfig(D16QwenConfig):
             if isinstance(qwen_cfg, Mapping)
             else (lambda k, d: getattr(qwen_cfg, k, d))
         )
+        rope_params = get("rope_parameters", None) or {}
+        rope_theta = rope_params.get("rope_theta", get("rope_theta", 1000000.0))
         layers = int(get("num_hidden_layers", 24)) if num_hidden_layers is None else int(num_hidden_layers)
         return cls(
             vocab_size=int(get("vocab_size", 151936)),
@@ -85,7 +87,7 @@ class D16QwenImportConfig(D16QwenConfig):
             num_attention_heads=int(get("num_attention_heads", 14)),
             num_key_value_heads=int(get("num_key_value_heads", 2)),
             rms_norm_eps=float(get("rms_norm_eps", 1e-6)),
-            rope_theta=float(get("rope_theta", 1000000.0)),
+            rope_theta=float(rope_theta),
             tie_word_embeddings=bool(get("tie_word_embeddings", True)),
             attention_bias=bool(get("attention_bias", True)),
             mlp_bias=bool(get("mlp_bias", False)),
@@ -106,7 +108,7 @@ class D16QwenImportConfig(D16QwenConfig):
         rope_theta: float = 1000000.0,
         indiff_eps: IndiffThreshold = 0.0,
         indiff_rel: float = 0.25,
-        mlp_activation: MLPActivation = "gate",
+        mlp_activation: MLPActivation = "bilinear",
         collect_d16_stats: bool = False,
     ) -> "D16QwenImportConfig":
         """Infer 1-to-1 D16QwenImportConfig dimensions directly from a Qwen state_dict."""
@@ -856,15 +858,20 @@ def import_qwen_weights(
     min_orbit_score: float = 0.25,
     indiff_eps: IndiffThreshold = 0.0,
     indiff_rel: float = 0.25,
-    mlp_activation: MLPActivation = "gate",
-    second_coord_mode: str = "zero",
+    mlp_activation: MLPActivation = "bilinear",
+    second_coord_mode: str = "d16_sat_rope_gate",
     c_sat: float = WEDGE_SAT_SLOPE,
     c_w0: float = WEDGE_HALF_SAT,
     dtype: Optional[torch.dtype] = None,
     device: Optional[Union[str, torch.device]] = None,
     verbose: bool = True,
 ) -> Tuple[D16QwenForCausalLM, ConversionReport]:
-    """Import weights 1-to-1 from a Qwen file/folder/model/state_dict into `d16_qwen_model2.D16QwenForCausalLM`."""
+    """Import all Qwen layers by default, with analytical Im coordinates and a bilinear MLP.
+
+    The analytical mode puts source weights in Re. Projection matrices use their
+    RoPE/gate or adjacent partners for Im; norm gains and non-Q/K biases stay real.
+    An explicit config controls the MLP activation when supplied.
+    """
     # Load raw checkpoint onto CPU first to avoid doubling GPU VRAM during import:
     state_dict, cfg_dict = load_qwen_checkpoint(source, device="cpu")
 
@@ -1062,6 +1069,8 @@ def _deserialize_config(cfg_dict: Mapping[str, Any]) -> Union[D16QwenImportConfi
     target_cls = D16QwenImportConfig if is_1to1 else D16QwenConfig
     valid_keys = {f.name for f in fields(target_cls)}
     filtered = {k: v for k, v in cfg_dict.items() if k in valid_keys}
+    # Older configs without an explicit activation used the pre-bilinear defaults.
+    filtered.setdefault("mlp_activation", "gate" if is_1to1 else "sigmoid")
     return target_cls(**filtered)
 
 
