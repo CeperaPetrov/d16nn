@@ -224,12 +224,12 @@ class D16RotaryEmbedding(nn.Module):
         self.head_dim = head_dim
         self.base = base
         self.register_buffer("frequency_indices", torch.arange(head_dim))
-        self._step_rotor: Optional[D16ComplexTensor] = None
         self._rotor_table: Optional[D16ComplexTensor] = None
+        self._next_power: Optional[D16ComplexTensor] = None
 
     def _invalidate_cache(self) -> None:
-        self._step_rotor = None
         self._rotor_table = None
+        self._next_power = None
 
     def use_qwen_half_head_frequencies(self) -> None:
         """Give corresponding channels in the two halves of a Qwen head the same frequency."""
@@ -266,22 +266,21 @@ class D16RotaryEmbedding(nn.Module):
 
     @torch.no_grad()
     def _ensure_table(self, required_length: int, device: torch.device) -> D16ComplexTensor:
-        if self._step_rotor is None or self._step_rotor.device != device:
-            self._step_rotor = self._build_step_rotor(device)
+        if self._rotor_table is None or self._rotor_table.device != device:
             self._rotor_table = D16ComplexTensor.ones(
                 (1, self.head_dim), dtype=torch.float64, device=device
             )
+            self._next_power = self._build_step_rotor(device).map_tensors(
+                lambda t: t.unsqueeze(0)
+            )
         table = self._rotor_table
-        assert table is not None and self._step_rotor is not None
-        if table.shape[0] < required_length:
-            table = D16ComplexTensor.ones((1, self.head_dim), dtype=torch.float64, device=device)
-            power = self._step_rotor.map_tensors(lambda t: t.unsqueeze(0))
-            while table.shape[0] < required_length:
-                need = min(table.shape[0], required_length - table.shape[0])
-                table = D16ComplexTensor.cat((table, table[:need] * power), dim=0)
-                if table.shape[0] < required_length:
-                    power = power.square()
-            self._rotor_table = table
+        power = self._next_power
+        assert table is not None and power is not None
+        while table.shape[0] < required_length:
+            table = D16ComplexTensor.cat((table, table * power), dim=0)
+            power = power.square()
+        self._rotor_table = table
+        self._next_power = power
         return table
 
     def forward(

@@ -881,20 +881,15 @@ if _HAS_TORCH:
         """Vectorized local multiplication inside the [0°, 22.5°] fundamental wedge."""
         is_nan = (am == MASK_NAN) | (bm == MASK_NAN)
         is_zero = (~is_nan) & ((am == MASK_ZERO) | (bm == MASK_ZERO))
-        ka = even_anchor_u16(am)
-        kb = even_anchor_u16(bm)
-
-        ma = ((ka + 1) // 2) & 7
-        mb = ((kb + 1) // 2) & 7
-        pa = ka & 1
-        pb = kb & 1
+        ma, pa = _chart_parameters(am)
+        mb, pb = _chart_parameters(bm)
 
         ac = ax * bx
         bd = ay * by
         ad = ax * by
         bc = ay * bx
 
-        base_k = (2 * ((ma + mb) & 7)) & 15
+        base_k = ((ma + mb) & 7) << 1
         same_p = pa == pb
 
         u = ac - bd
@@ -902,11 +897,11 @@ if _HAS_TORCH:
         cross_bis = above_bisector_d16(u, v)
         k_same_p0 = torch.where(cross_bis, (base_k + 1) & 15, base_k)
         k_same_p1 = torch.where(cross_bis, (base_k + 14) & 15, (base_k + 15) & 15)
-        k_same = torch.where(pa == 0, k_same_p0, k_same_p1)
+        k_same = torch.where(pa, k_same_p1, k_same_p0)
         ox_same = torch.where(cross_bis, rotated_sum_d16(u, v), u)
         oy_same = torch.where(cross_bis, (u - v) * INV_SQRT2, v)
 
-        neg_dev = torch.where(pa == 0, bc < ad, ad < bc)
+        neg_dev = torch.where(pa, ad < bc, bc < ad)
         k_diff = torch.where(neg_dev, (base_k + 15) & 15, base_k)
         ox_diff = ac + bd
         oy_diff = (bc - ad).abs()
@@ -915,10 +910,11 @@ if _HAS_TORCH:
         out_y = torch.where(same_p, oy_same, oy_diff)
         out_k = torch.where(same_p, k_same, k_diff)
         rx, ry, rm = d16_reduced_u16(out_x, out_y, out_k, is_zero)
-        rx = torch.where(is_nan, torch.zeros_like(rx), rx)
-        ry = torch.where(is_nan, torch.zeros_like(ry), ry)
-        rm = torch.where(is_nan, torch.zeros_like(rm), rm)
-        return rx, ry, rm
+        return (
+            rx.masked_fill(is_nan, 0.0),
+            ry.masked_fill(is_nan, 0.0),
+            rm.masked_fill(is_nan, MASK_NAN),
+        )
 
     @lru_cache(maxsize=None)
     def _dihedral_op_table(device: torch.device) -> torch.Tensor:
@@ -1668,19 +1664,18 @@ if _HAS_TORCH:
                 out_re = ar @ br - ai @ bi
                 out_im = ar @ bi + ai @ br
             out = D16ComplexTensor.pack(out_re, out_im).to(dtype)
-            if bool(self.is_nan().any()) or bool(other.is_nan().any()):
-                a_nan = self.is_nan().unsqueeze(0) if self.ndim == 1 else self.is_nan()
-                b_nan = other.is_nan().unsqueeze(1) if other.ndim == 1 else other.is_nan()
-                undefined = a_nan.any(dim=-1, keepdim=True) | b_nan.any(dim=-2, keepdim=True)
-                if self.ndim == 1:
-                    undefined = undefined.squeeze(-2)
-                if other.ndim == 1:
-                    undefined = undefined.squeeze(-1)
-                out = D16ComplexTensor(
-                    out.x.masked_fill(undefined, 0.0),
-                    out.y.masked_fill(undefined, 0.0),
-                    out.rotation.masked_fill(undefined, MASK_NAN),
-                )
+            a_nan = self.is_nan().unsqueeze(0) if self.ndim == 1 else self.is_nan()
+            b_nan = other.is_nan().unsqueeze(1) if other.ndim == 1 else other.is_nan()
+            undefined = a_nan.any(dim=-1, keepdim=True) | b_nan.any(dim=-2, keepdim=True)
+            if self.ndim == 1:
+                undefined = undefined.squeeze(-2)
+            if other.ndim == 1:
+                undefined = undefined.squeeze(-1)
+            out = D16ComplexTensor(
+                out.x.masked_fill(undefined, 0.0),
+                out.y.masked_fill(undefined, 0.0),
+                out.rotation.masked_fill(undefined, MASK_NAN),
+            )            
             return out
 
         def __matmul__(self, other: "D16ComplexTensor") -> "D16ComplexTensor":
