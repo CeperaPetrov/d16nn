@@ -29,8 +29,73 @@ from d16_qwen_importer import (
     D16QwenImportConfig, WEDGE_HALF_SAT, WEDGE_SAT_SLOPE, compute_d16_second_coord,
     import_qwen_weights, load_d16_checkpoint, pack_weights_1to1, save_d16_checkpoint,
 )
-from d16_qwen_model2 import D16QwenConfig, D16QwenForCausalLM, encode_token_ids
+from d16_qwen_model2 import D16QwenConfig, D16QwenForCausalLM, D16RotaryEmbedding, encode_token_ids
 from d16_vis_utils import relative_weight_shift
+
+
+class TestD16Phase(unittest.TestCase):
+    def test_rotary_embedding_uses_direct_rotors_on_both_frequency_grids(self) -> None:
+        rope = D16RotaryEmbedding(head_dim=64)
+        ids = torch.tensor([[0, 1, 1065, 32767]])
+        hidden = D16ComplexTensor.ones((), dtype=torch.bfloat16)
+        for half_head in (False, True):
+            with self.subTest(half_head=half_head):
+                if half_head:
+                    rope.use_qwen_half_head_frequencies()
+                phase = ids.float().unsqueeze(-1) * rope.base ** (-rope.frequency_indices.float() / 64)
+                expected = D16ComplexTensor.pack(phase.cos(), phase.sin()).to(hidden.dtype)
+                with patch.object(D16ComplexTensor, "pack", side_effect=AssertionError("RoPE called pack")):
+                    actual = rope(hidden, ids)
+                self.assertEqual(actual.dtype, hidden.dtype)
+                self.assertTrue(torch.equal(actual.rotation, expected.rotation))
+                for got, ref in zip(actual.unpack(), expected.unpack()):
+                    torch.testing.assert_close(got, ref)
+
+    def test_from_phase_preserves_sectors_and_long_context_rope_angles(self) -> None:
+        for dtype in (torch.float32, torch.float64):
+            with self.subTest(dtype=dtype):
+                axes = torch.arange(-16, 17, dtype=dtype) * (math.pi / 8)
+                offsets = torch.tensor([-1e-5, 0, 1e-5], dtype=dtype)
+                phases = torch.cat([
+                    (axes[:, None] + offsets).flatten(),
+                    torch.tensor([-32767, -1065, 1065, 32767, 2**20, 2**20 + 1,
+                                  -1e19, torch.finfo(dtype).max], dtype=dtype),
+                ])
+                z = D16ComplexTensor.from_phase(phases)
+                # Evaluate the oracle in double for the actual input values.
+                radians = phases.double()
+                ref = D16ComplexTensor.pack(radians.cos(), radians.sin())
+                self.assertTrue(torch.equal(z.rotation, ref.rotation))
+                for got, expected in zip(z.unpack(), ref.unpack()):
+                    torch.testing.assert_close(got, expected.to(dtype), atol=4 * torch.finfo(dtype).eps, rtol=0)
+                self.assertEqual(z.rotation[phases == 1065].item(), 0x0100)
+
+        invalid = D16ComplexTensor.from_phase(torch.tensor([math.nan, math.inf, -math.inf]))
+        self.assertTrue(invalid.is_nan().all())
+        self.assertTrue((invalid.norm_squared() == 0).all())
+
+    def test_from_phase_gradient_at_axes_and_in_reflected_sectors(self) -> None:
+        phase = (torch.arange(-17, 18, dtype=torch.float64) * (math.pi / 16)).requires_grad_()
+        re, im = D16ComplexTensor.from_phase(phase).unpack()
+        (2 * re + im).sum().backward()
+        torch.testing.assert_close(phase.grad, phase.cos() - 2 * phase.sin(), atol=1e-14, rtol=0)
+
+    def test_random_polar_preserves_seeded_radius_and_sector_sampling(self) -> None:
+        for normal in (False, True):
+            with self.subTest(normal=normal), torch.random.fork_rng(devices=[]):
+                torch.manual_seed(43)
+                z = D16ComplexTensor.random_polar((1024,), std=0.5, normal=normal, dtype=torch.float64)
+                torch.manual_seed(43)
+                sample = torch.rand(1024, dtype=torch.float64)
+                radius = 0.5 * (-2 * sample.log()).sqrt() if normal else sample.sqrt()
+                angle = torch.rand_like(sample) * (math.pi / 8)
+                sector = torch.randint(16, sample.shape)
+                turns = ((sector + 1) // 2).to(angle.dtype)
+                phase = turns * (math.pi / 4) + torch.where(sector % 2 == 0, angle, -angle)
+                re, im = z.unpack()
+                torch.testing.assert_close(re, radius * phase.cos(), atol=2e-15, rtol=0)
+                torch.testing.assert_close(im, radius * phase.sin(), atol=2e-15, rtol=0)
+        self.assertTrue(D16ComplexTensor.random_polar((8,), std=0).is_zero().all())
 
 
 class TestD16EncapsulationAndAutograd(unittest.TestCase):
