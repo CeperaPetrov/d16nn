@@ -169,7 +169,7 @@ class D16AdamW:
 
         apply_indiff = self._should_apply_indiff_threshold(parameter)
         auto_indiff = apply_indiff and self.indiff_eps == "auto"
-        sq_sum = torch.zeros((), dtype=torch.float64, device=parameter.x.device) if auto_indiff else None
+        statistics = None
 
         for index in self._tiles(parameter):
             stored_weight = weights[index]
@@ -191,18 +191,16 @@ class D16AdamW:
             if apply_indiff and not auto_indiff:
                 rounded = rounded.apply_Manifold_Threshold_L1(self.indiff_eps, rel=self.indiff_rel, dim=None)
             elif auto_indiff:
-                assert sq_sum is not None
-                sq_sum += rounded.to(dtype).norm_squared().sum(dtype=torch.float64)
+                tile_statistics = rounded.rms_statistics()
+                statistics = tile_statistics if statistics is None else statistics.merge(tile_statistics)
 
             parameter.copy_(rounded, index=index)
             moments.first.copy_slice_(index, first)
 
-        if auto_indiff:
-            assert sq_sum is not None
-            threshold = (sq_sum / max(parameter.x.numel(), 1)).sqrt() * self.indiff_rel
-            weights = parameter.value()
+        if statistics is not None:
             for index in self._tiles(parameter):
-                parameter.copy_(weights[index].apply_Manifold_Threshold_L1(threshold, dim=None), index=index)
+                pruned = weights[index].apply_Manifold_Threshold_L1("auto", rel=self.indiff_rel, statistics=statistics)
+                parameter.copy_(pruned, index=index)
 
     def state_dict(self) -> dict:
         """Serialize optimizer moments using tensors and primitive metadata."""
