@@ -1038,6 +1038,14 @@ if _HAS_TORCH:
             remainder -= _TAU_FIXED
         return remainder / (1 << 1152)
 
+    def _angle_gradient(
+        x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor, grad_x: torch.Tensor, grad_y: torch.Tensor
+    ) -> torch.Tensor:
+        # An increasing global angle traverses a reflected chart in reverse.
+        _, reflected = _chart_parameters(mask)
+        tangent = x * grad_y - y * grad_x
+        return torch.where(reflected, -tangent, tangent).masked_fill(mask == MASK_NAN, 0)
+
     class _FromPhase(torch.autograd.Function):
         @staticmethod
         def forward(ctx, phase: torch.Tensor):
@@ -1067,10 +1075,34 @@ if _HAS_TORCH:
         @staticmethod
         def backward(ctx, grad_x, grad_y, _grad_mask):
             x, y, mask = ctx.saved_tensors
-            # In a reflected chart increasing the global angle reverses the tangent.
-            _, reflected = _chart_parameters(mask)
-            tangent = x * grad_y - y * grad_x
-            return torch.where(reflected, -tangent, tangent).masked_fill(mask == MASK_NAN, 0)
+            return _angle_gradient(x, y, mask, grad_x, grad_y)
+
+    def _bounded_cayley_argument(t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        invert = t.abs() > 1
+        reciprocal = torch.where(invert, t, 1.0).reciprocal()
+        return torch.where(invert, reciprocal, t), invert
+
+    class _FromCayley(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, t):
+            u, invert = _bounded_cayley_argument(t)
+            u2 = u.square()
+            inv = (1 + u2).reciprocal()
+            real = (1 - u2) * inv
+            # C(t) = -conj(C(1/t)) for the reciprocal branch.
+            real = torch.where(invert, -real, real).masked_fill(~torch.isfinite(t), float("nan"))
+            x, y, mask = d16_from_xy_u16(real, (2 * u) * inv)
+            ctx.save_for_backward(t, x, y, mask)
+            ctx.mark_non_differentiable(mask)
+            return x, y, mask
+
+        @staticmethod
+        def backward(ctx, grad_x, grad_y, _grad_mask):
+            t, x, y, mask = ctx.saved_tensors
+            u, invert = _bounded_cayley_argument(t)
+            speed = 2 / (1 + u.square())
+            speed = torch.where(invert, (speed * u) * u, speed).masked_fill(mask == MASK_NAN, 0)
+            return _angle_gradient(x, y, mask, grad_x, grad_y) * speed
 
     class _PackComplex(torch.autograd.Function):
         @staticmethod
@@ -1235,6 +1267,21 @@ if _HAS_TORCH:
             mask.masked_fill(undefined, MASK_NAN),
         )
 
+    @dataclass(frozen=True, eq=False)
+    class _RMSStatistics:
+        scale: torch.Tensor
+        scaled_sum_squares: torch.Tensor
+        count: int
+
+        def merge(self, other: "_RMSStatistics") -> "_RMSStatistics":
+            scale = torch.maximum(self.scale, other.scale)
+            divisor = scale.masked_fill(scale == 0, 1.0)
+            squares = (
+                self.scaled_sum_squares * (self.scale / divisor).square()
+                + other.scaled_sum_squares * (other.scale / divisor).square()
+            )
+            return _RMSStatistics(scale, squares, self.count + other.count)
+
     class D16ComplexTensor:
         """Vectorized PyTorch container of D16Complex objects with full autograd and operator encapsulation."""
 
@@ -1320,16 +1367,13 @@ if _HAS_TORCH:
             if not phase.is_floating_point():
                 raise TypeError("phase must be a real floating-point tensor in radians")
             return cls(*_FromPhase.apply(phase))
-        
+
         @classmethod
         def from_cayley(cls, tangent: torch.Tensor) -> "D16ComplexTensor":
             """Construct canonical unit rotors via rational Cayley map (1 - t^2 + 2it) / (1 + t^2)."""
             if not tangent.is_floating_point():
                 raise TypeError("tangent must be a real floating-point tensor")
-            t = tangent.double()
-            t2 = t * t
-            inv = (1.0 + t2).reciprocal()
-            x, y, mask = d16_from_xy_u16((1.0 - t2) * inv, (2.0 * t) * inv)
+            x, y, mask = _FromCayley.apply(tangent.double())
             return cls(x.to(tangent.dtype), y.to(tangent.dtype), mask)
 
         @classmethod
@@ -1528,6 +1572,12 @@ if _HAS_TORCH:
         def map_tensors(self, op: Callable[[torch.Tensor], torch.Tensor]) -> "D16ComplexTensor":
             return D16ComplexTensor(op(self.x), op(self.y), op(self.rotation))
 
+        def record_stream(self, stream: torch.cuda.Stream) -> None:
+            """Keep the D16 storage alive until work on this CUDA stream completes."""
+            self.x.record_stream(stream)
+            self.y.record_stream(stream)
+            self.rotation.record_stream(stream)
+
         def split(self, split_size: int, dim: int = 0) -> Tuple["D16ComplexTensor", ...]:
             return tuple(
                 D16ComplexTensor(tx, ty, tr)
@@ -1552,36 +1602,46 @@ if _HAS_TORCH:
             z_m = torch.where(cond, torch.full_like(self.rotation, MASK_ZERO), self.rotation)
             return D16ComplexTensor(z_x, z_y, z_m)
 
+        @torch.no_grad()
+        def rms_statistics(self, dim: Optional[Union[int, Tuple[int, ...]]] = None) -> _RMSStatistics:
+            """Scaled sum of squared radii per reduction group, mergeable over disjoint tiles."""
+            if self.numel() == 0:
+                zero = self.x.sum(dim=dim, keepdim=True, dtype=torch.float64)
+                return _RMSStatistics(zero, zero, 0)
+            # x bounds both coordinates in the canonical wedge. Keep the true zero
+            # scale for merging all-zero tiles with arbitrarily small nonzero tiles.
+            scale = self.x.amax(dim=dim, keepdim=True).double()
+            divisor = scale.masked_fill(scale == 0, 1.0)
+            radii_sq = (self.x.double() / divisor).square_()
+            y = self.y.double() / divisor
+            radii_sq.addcmul_(y, y)
+            return _RMSStatistics(scale, radii_sq.sum(dim=dim, keepdim=True), self.numel() // scale.numel())
+
         def apply_Manifold_Threshold_L1(
             self,
             eps: Union[float, torch.Tensor, str] = 0.0,
             *,
             rel: float = 0.25,
             dim: Optional[Union[int, Tuple[int, ...]]] = -1,
+            statistics: Optional[_RMSStatistics] = None,
         ) -> "D16ComplexTensor":
+            """Apply an L1 cutoff. For 'auto', tiles may share their parent's RMS statistics."""
             if isinstance(eps, str):
                 if eps != "auto":
                     raise ValueError(f"Unknown manifold threshold mode: {eps!r}")
                 if rel <= 0.0:
                     return self
-            elif isinstance(eps, (int, float)) and eps <= 0.0:
-                return self
-
-            calc_dtype = torch.float64 if self.dtype == torch.float64 else torch.float32
-            x = self.x.to(calc_dtype)
-            y = self.y.to(calc_dtype)
-
-            if isinstance(eps, str):
-                msq = x.square() + y.square()
-                if dim is not None:
-                    rms = msq.mean(dim=dim, keepdim=True, dtype=torch.float64).sqrt()
-                else:
-                    rms = msq.mean(dtype=torch.float64).sqrt()
-                threshold: Union[float, torch.Tensor] = rms * rel
-            elif isinstance(eps, (int, float)):
-                threshold = float(eps)
+                if statistics is None:
+                    statistics = self.rms_statistics(dim)
+                divisor = statistics.scale.masked_fill(statistics.scale == 0, 1.0)
+                x, y = self.x.double() / divisor, self.y.double() / divisor
+                threshold = (statistics.scaled_sum_squares / max(statistics.count, 1)).sqrt() * rel
             else:
-                threshold = eps
+                if isinstance(eps, (int, float)) and eps <= 0.0:
+                    return self
+                calc_dtype = torch.float64 if self.dtype == torch.float64 else torch.float32
+                x, y = self.x.to(calc_dtype), self.y.to(calc_dtype)
+                threshold = float(eps) if isinstance(eps, (int, float)) else eps
 
             turns, _ = _chart_parameters(self.rotation)
             l1 = torch.where((turns & 1) != 0, x * SQRT2, x + y)
