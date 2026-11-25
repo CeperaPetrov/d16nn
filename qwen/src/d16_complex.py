@@ -995,14 +995,6 @@ if _HAS_TORCH:
         y_oriented = torch.where(reflected, -y, y)
         return cos * x - sin * y_oriented, sin * x + cos * y_oriented
 
-    def _into_chart(
-        re: torch.Tensor, im: torch.Tensor, rotation: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        turns, reflected = _chart_parameters(rotation)
-        cos, sin = _rotation_basis(turns, re.dtype)
-        y = cos * im - sin * re
-        return cos * re + sin * im, torch.where(reflected, -y, y)
-
     def _between_charts(
         x: torch.Tensor,
         y: torch.Tensor,
@@ -1114,24 +1106,35 @@ if _HAS_TORCH:
         @staticmethod
         def backward(ctx, grad_x, grad_y, _grad_rotation):
             ax, ay, ar, bx, by, br, rotation = ctx.saved_tensors
-            grad_re, grad_im = _from_chart(grad_x, grad_y, rotation)
-            defined = rotation != MASK_NAN
+            need_a = ctx.needs_input_grad[0] or ctx.needs_input_grad[1]
+            need_b = ctx.needs_input_grad[3] or ctx.needs_input_grad[4]
+            if not (need_a or need_b):
+                return None, None, None, None, None, None
 
-            def operand_gradient(x, y, mask, other_x, other_y, other_mask):
-                re, im = _from_chart(other_x, other_y, other_mask)
-                local_x, local_y = _into_chart(
-                    grad_re * re + grad_im * im, grad_im * re - grad_re * im, mask
-                )
+            rot_turns, rot_reflected = _chart_parameters(rotation)
+            a_turns, a_reflected = _chart_parameters(ar)
+            b_turns, b_reflected = _chart_parameters(br)
+            cos, sin = _rotation_basis((rot_turns - a_turns - b_turns) & 7, grad_x.dtype)
+            gy_o = torch.where(rot_reflected, -grad_y, grad_y)
+            rgx = cos * grad_x - sin * gy_o
+            rgy = sin * grad_x + cos * gy_o
+            undefined = rotation == MASK_NAN
+
+            def operand_gradient(x, y, op_reflected, other_x, other_y, other_reflected):
+                oy = torch.where(other_reflected, -other_y, other_y)
+                local_x = rgx * other_x + rgy * oy
+                local_y = rgy * other_x - rgx * oy
+                local_y = torch.where(op_reflected, -local_y, local_y)
                 return (
-                    local_x.masked_fill(~defined, 0).sum_to_size(x.shape),
-                    local_y.masked_fill(~defined, 0).sum_to_size(y.shape),
+                    local_x.masked_fill(undefined, 0).sum_to_size(x.shape),
+                    local_y.masked_fill(undefined, 0).sum_to_size(y.shape),
                 )
 
             grad_ax = grad_ay = grad_bx = grad_by = None
-            if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
-                grad_ax, grad_ay = operand_gradient(ax, ay, ar, bx, by, br)
-            if ctx.needs_input_grad[3] or ctx.needs_input_grad[4]:
-                grad_bx, grad_by = operand_gradient(bx, by, br, ax, ay, ar)
+            if need_a:
+                grad_ax, grad_ay = operand_gradient(ax, ay, a_reflected, bx, by, b_reflected)
+            if need_b:
+                grad_bx, grad_by = operand_gradient(bx, by, b_reflected, ax, ay, a_reflected)
             return grad_ax, grad_ay, None, grad_bx, grad_by, None
 
     class _AddComplex(torch.autograd.Function):
