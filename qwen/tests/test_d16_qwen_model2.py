@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import replace
 import math
 from pathlib import Path
 import sys
 import tempfile
+from threading import Event
 import unittest
 from unittest.mock import patch
 
@@ -67,7 +70,111 @@ class TestD16Phase(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nonnegative"):
             rope(hidden_f64, torch.tensor([[-1]]))
         rope.cpu()
-        self.assertIsNone(rope._rotor_table)
+        self.assertIsNone(rope._cache)
+
+    def test_cayley_gradients_at_sector_boundaries_and_large_finite_inputs(self) -> None:
+        t = torch.tan(torch.arange(-7, 8, dtype=torch.float64) * (math.pi / 16))
+        t = torch.cat((t, t.new_tensor([-1., 1., -0.125, 0.125]))).requires_grad_()
+        real, imag = D16ComplexTensor.from_cayley(t).unpack()
+        denom = 1 + t.square()
+        torch.testing.assert_close(real, (1 - t.square()) / denom, rtol=0, atol=1e-14)
+        torch.testing.assert_close(imag, 2 * t / denom, rtol=0, atol=1e-14)
+        grad_real, = torch.autograd.grad(real.sum(), t, retain_graph=True)
+        grad_imag, = torch.autograd.grad(imag.sum(), t)
+        torch.testing.assert_close(grad_real, -4 * t / denom.square(), rtol=0, atol=1e-14)
+        torch.testing.assert_close(grad_imag, 2 * (1 - t.square()) / denom.square(), rtol=0, atol=1e-14)
+
+        extremes = t.new_tensor([1e155, -1e200, torch.finfo(t.dtype).max, math.inf, -math.inf, math.nan],
+                                requires_grad=True)
+        z = D16ComplexTensor.from_cayley(extremes)
+        self.assertTrue(torch.equal(z[:3].norm_squared(), torch.ones(3, dtype=t.dtype)))
+        self.assertTrue(z[:3].is_negative_real().all())
+        self.assertTrue(z[3:].is_nan().all())
+        z.unpack()[1].sum().backward()
+        self.assertTrue(torch.isfinite(extremes.grad).all())
+        self.assertLess(extremes.grad[0].item(), 0)
+        self.assertTrue((extremes.grad[3:] == 0).all())
+
+    def test_rotary_position_bound_with_cold_and_warm_cache(self) -> None:
+        rope = D16RotaryEmbedding(4)
+        hidden = D16ComplexTensor.ones((1, 3, 4), dtype=torch.float64)
+        ids = torch.tensor([[5, 6, 7]], dtype=torch.int32)
+        for warm in (False, True):
+            if warm:
+                rope(hidden, ids)
+            with self.assertRaisesRegex(ValueError, "nonnegative"):
+                rope(hidden, torch.tensor([-1]), max_position=0)
+            with self.assertRaisesRegex(ValueError, "exceed"):
+                rope(hidden, ids, max_position=6)
+        for dtype in (torch.float32, torch.uint8, torch.bool):
+            with self.assertRaisesRegex(TypeError, "int32 or int64"):
+                rope(hidden, ids.to(dtype))
+        self.assertEqual(rope(hidden, ids[:, :0], max_position=0).shape, (1, 0, 4))
+        explicit = rope(hidden, ids, max_position=7)
+        with patch.object(torch, "aminmax", side_effect=AssertionError("implicit positions read back indices")):
+            contiguous = rope(hidden, None, max_position=7)
+        torch.testing.assert_close(contiguous.unpack(), explicit.unpack(), rtol=0, atol=0)
+        self.assertTrue(torch.equal(contiguous.rotation, explicit.rotation))
+
+    def test_rotary_cache_publishes_consistent_powers_to_concurrent_readers(self) -> None:
+        rope = D16RotaryEmbedding(4)
+        hidden = D16ComplexTensor.ones((), dtype=torch.float64)
+        building, second_miss, resume = Event(), Event(), Event()
+        build, lookup = rope._build_step_rotor, rope._cached_table
+
+        def pause_build(*args):
+            building.set()
+            if not resume.wait(10):
+                raise TimeoutError("first cache build stalled")
+            return build(*args)
+
+        def observe_lookup(device):
+            cache = lookup(device)
+            if building.is_set() and cache is None:
+                second_miss.set()
+            return cache
+
+        with (
+            patch.object(rope, "_build_step_rotor", side_effect=pause_build) as builder,
+            patch.object(rope, "_cached_table", side_effect=observe_lookup),
+            ThreadPoolExecutor(2) as pool,
+        ):
+            first = pool.submit(rope, hidden, torch.tensor([15]))
+            try:
+                self.assertTrue(building.wait(10))
+                second = pool.submit(rope, hidden, torch.tensor([7]))
+                self.assertTrue(second_miss.wait(10))
+            finally:
+                resume.set()
+            actual = D16ComplexTensor.cat([first.result(), second.result()], dim=0)
+            builder.assert_called_once()
+        fresh = deepcopy(rope)
+        self.assertIsNone(fresh._cache)
+        expected = fresh(hidden, torch.tensor([15, 7]))
+        torch.testing.assert_close(actual.unpack(), expected.unpack(), rtol=0, atol=0)
+        self.assertTrue(torch.equal(actual.rotation, expected.rotation))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required for stream ordering")
+    def test_rotary_cache_is_visible_across_cuda_streams(self) -> None:
+        rope = D16RotaryEmbedding(8).cuda()
+        hidden = D16ComplexTensor.ones((1, 4, 8), dtype=torch.float64, device="cuda")
+        producer, reader = torch.cuda.Stream(), torch.cuda.Stream()
+        for stream in (producer, reader):
+            stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(producer):
+            rope(hidden, None, max_position=2047)
+        with torch.cuda.stream(reader):
+            extended = rope(hidden, None, max_position=4095)
+        with torch.cuda.stream(producer):
+            cached = rope(hidden, None, max_position=2047)
+        rope.cpu()
+        for stream in (producer, reader):
+            torch.cuda.current_stream().wait_stream(stream)
+        reference = D16RotaryEmbedding(8).cuda()
+        for actual, end in ((cached, 2047), (extended, 4095)):
+            expected = reference(hidden, None, max_position=end)
+            torch.testing.assert_close(actual.unpack(), expected.unpack(), rtol=0, atol=0)
+            self.assertTrue(torch.equal(actual.rotation, expected.rotation))
 
     def test_from_phase_preserves_sectors_and_long_context_rope_angles(self) -> None:
         for dtype in (torch.float32, torch.float64):
@@ -788,6 +895,41 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
             _ = model(d16_ids)
             sp_0 = model.get_d16_state_summary()["indifferent_pct"]
             self.assertEqual(sp_0, 0.0)
+
+    def test_auto_threshold_uses_each_rows_rms_and_all_sector_orientations(self) -> None:
+        angle = (torch.arange(16, dtype=torch.float64) + 0.5) * (math.pi / 8)
+        radius = torch.tensor([[1e-4], [1e4]], dtype=torch.float64)
+        real, imag = radius * angle.cos(), radius * angle.sin()
+        z = D16ComplexTensor.pack(real, imag)
+        result = z.apply_Manifold_Threshold_L1("auto", rel=1.18, dim=-1)
+        expected = (real.abs() + imag.abs()) <= 1.18 * radius
+        self.assertTrue(torch.equal(result.is_zero(), expected))
+
+    def test_auto_threshold_agrees_across_axes_and_optimizer_tiles(self) -> None:
+        boundary = torch.tensor([1., 1., 2., 5., 7.])
+        boundary[1] = torch.nextafter(boundary[1], torch.tensor(0.))
+        cases = (
+            (boundary, [False, True, False, False, False]),
+            (torch.tensor([1., 2e19], dtype=torch.bfloat16), [True, False]),
+            (torch.tensor([1., 2e19], dtype=torch.float32), [True, False]),
+            (torch.tensor([1., 1e308], dtype=torch.float64), [True, False]),
+            (torch.tensor([0., 0., 1e-300, 2e-300], dtype=torch.float64), [True, True, False, False]),
+        )
+        for values, zeros in cases:
+            with self.subTest(dtype=values.dtype, values=values.tolist()):
+                z = D16ComplexTensor.from_real(values[:, None])
+                expected = z.to_indifferent_where(torch.tensor(zeros)[:, None])
+                masks = []
+                for dim in (None, (0, 1)):
+                    masks.append(z.apply_Manifold_Threshold_L1("auto", dim=dim).rotation)
+                for tile_size in (1, values.numel()):
+                    p = D16Parameter(z)
+                    p.x.grad = torch.zeros_like(p.x)
+                    opt = D16AdamW([p], lr=0., weight_decay=0., indiff_eps="auto", tile_size=tile_size)
+                    opt.step()
+                    masks.append(p.value().rotation)
+                    torch.testing.assert_close(p.value().unpack(), expected.unpack(), rtol=0, atol=0)
+                self.assertTrue(all(torch.equal(mask, expected.rotation) for mask in masks))
 
     def test_d16_adamw_manual_and_auto_indiff_eps(self) -> None:
         for mode_eps in (0.04, "auto"):
