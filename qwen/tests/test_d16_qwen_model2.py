@@ -265,7 +265,7 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
     def test_1to1_qwen_importer_quartets_and_unpaired_weights(self) -> None:
         sd = self._qwen_state_dict()
         cfg = D16QwenImportConfig.from_state_dict(sd, num_attention_heads=4, indiff_eps="auto", indiff_rel=0.30)
-        d16_model, report = import_qwen_weights(sd, config=cfg, min_orbit_score=0.60)
+        d16_model, report = import_qwen_weights(sd, config=cfg, min_orbit_score=0.60, second_coord_mode="zero")
 
         # Verify 1-to-1 coordinates and Re (in x) vs Im (in y) placement
         up_orig = sd["model.layers.0.mlp.up_proj.weight"]
@@ -289,6 +289,25 @@ class TestD16Model2TrainingAndGeneration(unittest.TestCase):
             self.assertTrue(bool((r_up.x == up_d16.x).all()))
             self.assertTrue(bool((r_up.y == up_d16.y).all()))
             self.assertTrue(bool((r_up.rotation == up_d16.rotation).all()))
+
+    def test_default_import_is_analytical_bilinear(self) -> None:
+        sd = self._qwen_state_dict()
+        model, report = import_qwen_weights(sd, verbose=False)
+        self.assertEqual(model.config.mlp_activation, "bilinear")
+        self.assertEqual(D16QwenConfig().mlp_activation, "bilinear")
+        self.assertEqual(report.total_imported_tensors, len(sd))
+        self.assertEqual(report.total_weights, sum(w.numel() for w in sd.values()))
+        self.assertIs(model.lm_head.weight, model.model.embed_tokens.weight)
+        for index, layer in enumerate(model.model.layers):
+            self.assertEqual(layer.mlp.mlp_activation, "bilinear")
+            prefix = f"model.layers.{index}.mlp."
+            weight, partner = sd[prefix + "up_proj.weight"], sd[prefix + "gate_proj.weight"]
+            real, imag = layer.mlp.up_proj.weight.value().unpack()
+            torch.testing.assert_close(real, weight)
+            torch.testing.assert_close(imag, compute_d16_second_coord(weight, partner_w=partner))
+            self.assertTrue(bool(imag.abs().any()))
+        nested = D16QwenImportConfig.from_qwen_config({"rope_parameters": {"rope_theta": 17333.0}})
+        self.assertEqual(nested.rope_theta, 17333.0)
 
     def test_rope_gate_computes_every_coordinate_with_an_explicit_partner(self) -> None:
         for width in (1, 3, 4):
