@@ -38,6 +38,20 @@ INV_SQRT2: float = 0.70710678118654752440
 TAN_PI_8: float = 0.41421356237309504880  # sqrt(2) - 1
 EPS_BOUND: float = 1e-12
 
+# Split pi/4 so subtracting the nearest axis retains low bits of a RoPE phase.
+_PI_OVER_4_HI = float.fromhex("0x1.921fb54400000p-1")
+_PI_OVER_4_LO = float.fromhex("0x1.0b4611a626331p-35")
+
+# floor(2*pi * 2**1152). The extra 128 bits beyond the largest binary64
+# exponent retain the angle even when a phase is too large for a split multiply.
+_TAU_FIXED = int(
+    "6487ed5110b4611a62633145c06e0e68948127044533e63a0105df531d89cd91"
+    "28a5043cc71a026ef7ca8cd9e69d218d98158536f92f8a1ba7f09ab6b6a8e122"
+    "f242dabb312f3f637a262174d31bf6b585ffae5b7a035bf6f71c35fdad44cfd2"
+    "d74f9208be258ff324943328f6722d9ee1003e5c50b1df82cc6d241b0e2ae9cd"
+    "348b1fd47e9267afc1b2ae91ee51d6cb0", 16
+)
+
 MASK_ZERO: int = 0xFFFF  # State 16: Indifferent (Zero)
 MASK_NAN: int = 0x0000   # State 17: Undefined (NaN)
 
@@ -906,14 +920,6 @@ if _HAS_TORCH:
         rm = torch.where(is_nan, torch.zeros_like(rm), rm)
         return rx, ry, rm
 
-    def apply_group_op_u16(m: torch.Tensor, op_id: int) -> torch.Tensor:
-        """Apply Z_8 |>< Z_2 element op_id in 0..15 purely to 16-bit mask tensor."""
-        op = op_id & 15
-        special = (m == MASK_ZERO) | (m == MASK_NAN)
-        base_m = m if op < 8 else reverse_bits_u16(m)
-        out = rol_u16(base_m, 2 * (op & 7))
-        return torch.where(special, m, out)
-
     @lru_cache(maxsize=None)
     def _dihedral_op_table(device: torch.device) -> torch.Tensor:
         """16 x 65536 int32 lookup table for all Z_8 |>< Z_2 actions on 16-bit masks."""
@@ -1010,6 +1016,52 @@ if _HAS_TORCH:
         chart = (t32 & 7) | (reflected.to(torch.int32) << 3)
         out = _dihedral_op_table(local_mask.device)[chart, lm & 0xFFFF]
         return out if out.dtype == local_mask.dtype else out.to(local_mask.dtype)
+
+    def _unit_wedge(angle: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Unit rotor at a local angle in [0, pi/8], via Padé [5/6] and Cayley."""
+        h = angle.double() * 0.5
+        a = h.square()
+        tangent = h * (10395 + a * (-1260 + 21 * a)) / (10395 + a * (-4725 + a * (210 - a)))
+        t2 = tangent.square()
+        inv = (1 + t2).reciprocal()
+        return ((1 - t2) * inv).to(angle.dtype), ((2 * tangent) * inv).to(angle.dtype)
+
+    def _reduce_large_phase(value: float) -> float:
+        """Reduce a finite binary64 angle to [-pi, pi] using exact integer arithmetic."""
+        numerator, denominator = value.as_integer_ratio()
+        scaled = (numerator << 1152) // denominator
+        remainder = scaled % _TAU_FIXED
+        if 2 * remainder > _TAU_FIXED:
+            remainder -= _TAU_FIXED
+        return remainder / (1 << 1152)
+
+    class _FromPhase(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, phase: torch.Tensor):
+            angle = phase.double()
+            finite = torch.isfinite(angle)
+            # Within this range the integer turn times the high part is exact.
+            large = finite & (angle.abs() > 2**20)
+            if large.any():
+                reduced = [_reduce_large_phase(value) for value in angle[large].tolist()]
+                angle = angle.masked_scatter(large, angle.new_tensor(reduced))
+            turns = (angle * (4 / math.pi)).round().masked_fill(~finite, 0)
+            delta = (angle - turns * _PI_OVER_4_HI) - turns * _PI_OVER_4_LO
+            sector = (2 * turns.to(torch.int32) - (delta < 0).int()) & 15
+            x, y = _unit_wedge(delta.abs())
+            x, y, mask = d16_reduced_u16(x, y, sector, angle.new_zeros((), dtype=torch.bool))
+            x, y = x.to(phase.dtype), y.to(phase.dtype)
+            ctx.save_for_backward(x, y, mask)
+            ctx.mark_non_differentiable(mask)
+            return x, y, mask
+
+        @staticmethod
+        def backward(ctx, grad_x, grad_y, _grad_mask):
+            x, y, mask = ctx.saved_tensors
+            # In a reflected chart increasing the global angle reverses the tangent.
+            _, reflected = _chart_parameters(mask)
+            tangent = x * grad_y - y * grad_x
+            return torch.where(reflected, -tangent, tangent).masked_fill(mask == MASK_NAN, 0)
 
     class _PackComplex(torch.autograd.Function):
         @staticmethod
@@ -1238,8 +1290,15 @@ if _HAS_TORCH:
                 radius = sample.sqrt() * (2 * std)
             angle = torch.rand_like(sample) * (math.pi / 8)
             sector = torch.randint(16, sample.shape, device=sample.device)
-            x, y, mask = d16_reduced_u16(radius * angle.cos(), radius * angle.sin(), sector, radius == 0)
-            return cls(x, y, mask.to(torch.int32))
+            ux, uy = _unit_wedge(angle)
+            return cls(*d16_reduced_u16(radius * ux, radius * uy, sector, radius == 0))
+
+        @classmethod
+        def from_phase(cls, phase: torch.Tensor) -> "D16ComplexTensor":
+            """Construct unit rotors from real floating-point radians in the input dtype and device."""
+            if not phase.is_floating_point():
+                raise TypeError("phase must be a real floating-point tensor in radians")
+            return cls(*_FromPhase.apply(phase))
 
         @classmethod
         def from_real(cls, value: Union[float, int, torch.Tensor]) -> "D16ComplexTensor":
