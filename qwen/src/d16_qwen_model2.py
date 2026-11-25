@@ -263,6 +263,11 @@ class D16RotaryEmbedding(nn.Module):
         super()._load_from_state_dict(state_dict, prefix, local_metadata, *args)
         self._invalidate_cache()
 
+    @staticmethod
+    def _renormalize_unit(rotor: D16ComplexTensor) -> D16ComplexTensor:
+        """Pure algebraic Newton step keeping unit rotors at |z| = 1 across doublings."""
+        return rotor * (1.5 - 0.5 * rotor.norm_squared())
+
     @torch.no_grad()
     def _build_step_rotor(self, device: torch.device) -> D16ComplexTensor:
         r = _algebraic_inv_root(self.base, self.head_dim)
@@ -273,7 +278,7 @@ class D16RotaryEmbedding(nn.Module):
         for _ in range(max_idx):
             ladder.append(ladder[-1] * r)
         s = torch.tensor([ladder[i] for i in indices], dtype=torch.float64, device=device)
-        return D16ComplexTensor.from_cayley(s).square().square()
+        return self._renormalize_unit(D16ComplexTensor.from_cayley(s).square().square())
 
     @torch.no_grad()
     def _ensure_table(self, required_length: int, device: torch.device) -> D16ComplexTensor:
@@ -294,7 +299,7 @@ class D16RotaryEmbedding(nn.Module):
         assert table is not None and power is not None
         while table.shape[0] < required_length:
             table = D16ComplexTensor.cat((table, table * power), dim=0)
-            power = power.square()
+            power = self._renormalize_unit(power.square())
         self._rotor_table = table
         self._next_power = power
         return table
@@ -316,56 +321,6 @@ class D16RotaryEmbedding(nn.Module):
                 max_position = 0
         elif max_position < 0:
             raise ValueError("max_position must be nonnegative")
-        table = self._ensure_table(max_position + 1, hidden_states.device)
-        return table[position_ids].to(hidden_states.dtype)
-
-    @torch.no_grad()
-    def _build_step_rotor(self, device: torch.device) -> D16ComplexTensor:
-        r = _algebraic_inv_root(self.base, self.head_dim)
-        indices = self.frequency_indices.tolist()
-        max_idx = max(indices, default=0)
-        # s_k = (1/8) * r^k in (0, 0.125] < tan(pi/16), strictly inside Sector 0 (0x0001).
-        ladder = [0.125]
-        for _ in range(max_idx):
-            ladder.append(ladder[-1] * r)
-        s = torch.tensor([ladder[i] for i in indices], dtype=torch.float64, device=device)
-        s2 = s * s
-        inv = 1.0 / (1.0 + s2)
-        quarter = D16ComplexTensor(
-            (1.0 - s2) * inv,
-            (2.0 * s) * inv,
-            torch.ones(len(indices), dtype=torch.int32, device=device),
-        )
-        return quarter.square().square()
-
-    @torch.no_grad()
-    def _ensure_table(self, required_length: int, device: torch.device) -> D16ComplexTensor:
-        if self._rotor_table is None or self._rotor_table.device != device:
-            self._rotor_table = D16ComplexTensor.ones(
-                (1, self.head_dim), dtype=torch.float64, device=device
-            )
-            self._next_power = self._build_step_rotor(device).map_tensors(
-                lambda t: t.unsqueeze(0)
-            )
-        table = self._rotor_table
-        power = self._next_power
-        assert table is not None and power is not None
-        while table.shape[0] < required_length:
-            table = D16ComplexTensor.cat((table, table * power), dim=0)
-            power = power.square()
-        self._rotor_table = table
-        self._next_power = power
-        return table
-
-    def forward(
-        self,
-        hidden_states: D16ComplexTensor,
-        position_ids: torch.Tensor,
-        *,
-        max_position: Optional[int] = None,
-    ) -> D16ComplexTensor:
-        if max_position is None:
-            max_position = int(position_ids.max().item()) if position_ids.numel() else 0
         table = self._ensure_table(max_position + 1, hidden_states.device)
         return table[position_ids].to(hidden_states.dtype)
 

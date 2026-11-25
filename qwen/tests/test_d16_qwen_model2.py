@@ -143,7 +143,7 @@ class TestD16EncapsulationAndAutograd(unittest.TestCase):
             "_MultiplyComplex",
             "_AddComplex",
         }
-        src_dir = Path(sys.path[0]) if Path(sys.path[0]).is_dir() else _THIS_DIR
+        src_dir = Path(sys.modules["d16_qwen_model2"].__file__).resolve().parent
         for fname in ("d16_parameter.py", "d16_adamw.py", "d16_qwen_model2.py", "d16_qwen_importer.py"):
             fpath = src_dir / fname if (src_dir / fname).is_file() else _THIS_DIR / fname
             tree = ast.parse(fpath.read_text(encoding="utf-8"), filename=fname)
