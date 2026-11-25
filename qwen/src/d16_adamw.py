@@ -122,15 +122,14 @@ class D16AdamW:
         return float(self.indiff_eps) > 0.0
 
     @torch.no_grad()
-    def step(self, max_grad_norm: float | None = None) -> torch.Tensor:
-        """Apply one update and return the unclipped global tangent norm."""
+    def step(self, max_grad_norm: float | None = None, *, release_grads: bool = False) -> torch.Tensor:
+        """Return the unclipped global norm. Optionally release each gradient after updating its weight."""
         if max_grad_norm is not None and not 0 <= max_grad_norm < math.inf:
             raise ValueError("max_grad_norm must be nonnegative and finite")
         first_parameter = self.parameters[0].x
-        grads = [(p.x.grad, p.y.grad) for p in self.parameters]
         norms = [
             torch.linalg.vector_norm(g, dtype=_accumulation_dtype(g)).to(first_parameter.device)
-            for pair in grads for g in pair if g is not None
+            for p in self.parameters for g in (p.x.grad, p.y.grad) if g is not None
         ]
         total_norm = (
             torch.linalg.vector_norm(torch.stack(norms))
@@ -152,6 +151,8 @@ class D16AdamW:
             if moments is None:
                 moments = self._moments[i] = _new_moments(parameter)
             self._update(parameter, moments, clip)
+            if release_grads:
+                parameter.zero_grad(set_to_none=True)
         return total_norm
 
     def _update(self, parameter: D16Parameter, moments: _Moments, clip: float | None) -> None:
