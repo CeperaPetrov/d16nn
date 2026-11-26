@@ -28,7 +28,6 @@ from d16_qwen_model2 import (
 from d16_qwen_training_state import (
     TrainingState,
     load_training_checkpoint,
-    read_training_metadata,
     save_inference_checkpoint,
     save_training_checkpoint,
 )
@@ -691,7 +690,7 @@ def _validate_and_save_best(
     metadata: dict,
     *,
     prev_rotations: Optional[dict[int, torch.Tensor]] = None,
-) -> dict[str, float | int]:
+) -> dict[str, float | int | dict]:
     metrics = evaluate(
         student, teacher, validation_blocks, args, student_device, teacher_device,
         prev_rotations=prev_rotations,
@@ -740,8 +739,6 @@ def train(args: argparse.Namespace) -> None:
     latest = args.output_dir / "latest.pt"
     if args.resume and not latest.is_file():
         raise FileNotFoundError(f"Missing resumable checkpoint {latest}")
-    if args.resume:
-        _ = read_training_metadata(latest)
 
     # Load teacher & tokenizer BEFORE creating output_dir so bad paths/downloads don't leave broken folders
     tok_kwargs: dict = {"local_files_only": local_only}
