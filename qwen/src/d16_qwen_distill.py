@@ -850,15 +850,6 @@ def train(args: argparse.Namespace) -> None:
             state = TrainingState()
             state.baseline = evaluate(student, teacher, validation_blocks, args, student_device, teacher_device)
             write_event(log, "epoch", epoch=0, step=0, validation=state.baseline)
-        if args.resume:
-            state = load_training_checkpoint(latest, student, optimizer, metadata)
-            if state.batch > steps_per_epoch or state.step != (state.epoch - 1) * steps_per_epoch + state.batch:
-                raise ValueError("Checkpoint cursor does not match this dataset")
-            write_event(log, "resume", epoch=state.epoch, batch=state.batch, step=state.step)
-        else:
-            state = TrainingState()
-            state.baseline = evaluate(student, teacher, validation_blocks, args, student_device, teacher_device)
-            write_event(log, "epoch", epoch=0, step=0, validation=state.baseline)
 
         prev_rotations = _snapshot_2d_rotations(student)
         
