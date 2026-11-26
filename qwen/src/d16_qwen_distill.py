@@ -17,6 +17,7 @@ from torch.nn import functional as F
 
 from d16_adamw import D16AdamW
 from d16_complex import D16ComplexTensor
+from d16_parameter import D16Parameter
 from d16_qwen_model2 import (
     D16Linear,
     D16QwenConfig,
@@ -472,6 +473,98 @@ def batch_losses(
             sampling_nll = float(logits.sampling_nll(ids_student[:, 1:], 1.0, eps=0.0, rel=0.0).item())
     return ce, kl, teacher_nll, sampling_nll
 
+def _iter_2d_d16_params(module: torch.nn.Module) -> list[D16Parameter]:
+    return list(dict.fromkeys(
+        m for m in module.modules() if isinstance(m, D16Parameter) and m.x.ndim >= 2
+    ))
+
+
+@torch.no_grad()
+def _snapshot_2d_rotations(student: D16QwenForCausalLM) -> dict[int, torch.Tensor]:
+    """Store 16-bit sector masks on CPU RAM as int16 (lossless bijection for 0..65535)."""
+    return {
+        id(p): p.rotation.detach().to(dtype=torch.int16, device="cpu", copy=True)
+        for p in student.d16_parameters()
+        if p.x.ndim >= 2
+    }
+
+
+@torch.no_grad()
+def _collect_layer_audit(
+    student: D16QwenForCausalLM,
+    prev_rotations: Optional[dict[int, torch.Tensor]] = None,
+) -> tuple[dict, float]:
+    """Audit per-layer 0xFFFF sparsity, weight RMS, and sector transitions since last validation."""
+    def _group_metrics(params: list[D16Parameter]) -> tuple[int, int, float, Optional[float]]:
+        zero_cnt, total_cnt = 0, 0
+        changed_cnt, compared_cnt = 0, 0
+        stats = None
+        for p in params:
+            val = p.value()
+            zero_cnt += int(val.is_zero().sum().item())
+            total_cnt += val.numel()
+            p_stats = val.rms_statistics()
+            stats = p_stats if stats is None else stats.merge(p_stats)
+            if prev_rotations is not None:
+                cur_rot = p.rotation.detach().to(dtype=torch.int16, device="cpu")
+                prev_rot = prev_rotations.get(id(p))
+                if prev_rot is not None and prev_rot.shape == cur_rot.shape:
+                    changed_cnt += int((cur_rot != prev_rot).sum().item())
+                    compared_cnt += cur_rot.numel()
+                prev_rotations[id(p)] = cur_rot
+        rms = (
+            float((stats.scale * (stats.scaled_sum_squares / max(stats.count, 1)).sqrt()).item())
+            if stats is not None and stats.count > 0
+            else 0.0
+        )
+        rot_pct = round((changed_cnt / compared_cnt) * 100.0, 3) if compared_cnt > 0 else None
+        return zero_cnt, total_cnt, rms, rot_pct
+
+    act_pcts: list[float] = []
+    w_pcts: list[float] = []
+    w_rms: list[float] = []
+    rot_pcts: list[float] = []
+    total_zero, total_elems = 0, 0
+
+    for layer in student.model.layers:
+        act_pct = (layer.mlp.indifferent_elements / max(layer.mlp.total_elements, 1)) * 100.0
+        act_pcts.append(round(act_pct, 3))
+        z_cnt, t_cnt, rms, r_pct = _group_metrics(_iter_2d_d16_params(layer))
+        total_zero += z_cnt
+        total_elems += t_cnt
+        w_pcts.append(round((z_cnt / max(t_cnt, 1)) * 100.0, 3))
+        w_rms.append(round(rms, 5))
+        if r_pct is not None:
+            rot_pcts.append(r_pct)
+
+    emb_param = student.model.embed_tokens.weight
+    ez, et, erms, erot = _group_metrics([emb_param])
+    total_zero += ez
+    total_elems += et
+
+    audit: dict = {
+        "act_indiff_pct": act_pcts,
+        "weight_indiff_pct": w_pcts,
+        "weight_rms": w_rms,
+        "embed_weight_indiff_pct": round((ez / max(et, 1)) * 100.0, 3),
+        "embed_weight_rms": round(erms, 5),
+    }
+    if rot_pcts:
+        audit["rot_change_pct"] = rot_pcts
+    if erot is not None:
+        audit["embed_rot_change_pct"] = erot
+
+    if student.lm_head.weight is not emb_param:
+        hz, ht, hrms, hrot = _group_metrics([student.lm_head.weight])
+        total_zero += hz
+        total_elems += ht
+        audit["lm_head_weight_indiff_pct"] = round((hz / max(ht, 1)) * 100.0, 3)
+        audit["lm_head_weight_rms"] = round(hrms, 5)
+        if hrot is not None:
+            audit["lm_head_rot_change_pct"] = hrot
+
+    global_weight_indiff_pct = (total_zero / max(total_elems, 1)) * 100.0
+    return audit, global_weight_indiff_pct
 
 @torch.no_grad()
 def evaluate(
@@ -481,7 +574,9 @@ def evaluate(
     args: argparse.Namespace,
     student_device: torch.device,
     teacher_device: torch.device,
-) -> dict[str, float | int]:
+    *,
+    prev_rotations: Optional[dict[int, torch.Tensor]] = None,
+) -> dict[str, float | int | dict]:
     student.eval()
     prev_collect = student.config.collect_d16_stats
     student.set_collect_d16_stats(True, reset=True)
@@ -509,22 +604,16 @@ def evaluate(
             token_count += n_tok
 
         act_summary = student.get_d16_state_summary()
+        layer_audit, weight_indiff_pct = _collect_layer_audit(student, prev_rotations=prev_rotations)
     finally:
         student.set_collect_d16_stats(prev_collect, reset=True)
 
-    weight_zero = 0
-    weight_total = 0
-    for param in student.d16_parameters():
-        if param.x.ndim >= 2:
-            val = param.value()
-            weight_zero += int(val.is_zero().sum().item())
-            weight_total += val.numel()
-
-    metrics: dict[str, float | int] = {name: total / token_count for name, total in totals.items()}
+    metrics: dict[str, float | int | dict] = {name: total / token_count for name, total in totals.items()}
     metrics["student_perplexity"] = _safe_perplexity(float(metrics["student_sampling_nll"]))
     metrics["teacher_perplexity"] = _safe_perplexity(float(metrics["teacher_nll"]))
     metrics["act_indiff_pct"] = float(act_summary["indifferent_pct"])
-    metrics["weight_indiff_pct"] = (weight_zero / max(weight_total, 1)) * 100.0
+    metrics["weight_indiff_pct"] = weight_indiff_pct
+    metrics["layer_audit"] = layer_audit
     metrics["tokens"] = token_count
     return metrics
 
@@ -600,8 +689,13 @@ def _validate_and_save_best(
     teacher_device: torch.device,
     state: TrainingState,
     metadata: dict,
+    *,
+    prev_rotations: Optional[dict[int, torch.Tensor]] = None,
 ) -> dict[str, float | int]:
-    metrics = evaluate(student, teacher, validation_blocks, args, student_device, teacher_device)
+    metrics = evaluate(
+        student, teacher, validation_blocks, args, student_device, teacher_device,
+        prev_rotations=prev_rotations,
+    )
     if state.best_validation is None or metrics["student_nll"] < state.best_validation["student_nll"]:
         save_inference_checkpoint(
             args.output_dir / "best.pt",
@@ -756,7 +850,18 @@ def train(args: argparse.Namespace) -> None:
             state = TrainingState()
             state.baseline = evaluate(student, teacher, validation_blocks, args, student_device, teacher_device)
             write_event(log, "epoch", epoch=0, step=0, validation=state.baseline)
+        if args.resume:
+            state = load_training_checkpoint(latest, student, optimizer, metadata)
+            if state.batch > steps_per_epoch or state.step != (state.epoch - 1) * steps_per_epoch + state.batch:
+                raise ValueError("Checkpoint cursor does not match this dataset")
+            write_event(log, "resume", epoch=state.epoch, batch=state.batch, step=state.step)
+        else:
+            state = TrainingState()
+            state.baseline = evaluate(student, teacher, validation_blocks, args, student_device, teacher_device)
+            write_event(log, "epoch", epoch=0, step=0, validation=state.baseline)
 
+        prev_rotations = _snapshot_2d_rotations(student)
+        
         if student_device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(student_device)
 
@@ -806,7 +911,8 @@ def train(args: argparse.Namespace) -> None:
                     break
                 if state.step % args.evaluate_every == 0:
                     validation = _validate_and_save_best(
-                        student, teacher, validation_blocks, args, student_device, teacher_device, state, metadata
+                        student, teacher, validation_blocks, args, student_device, teacher_device, state, metadata,
+                        prev_rotations=prev_rotations,
                     )
                     write_event(log, "validation", epoch=state.epoch, step=state.step, validation=validation)
                     student.train()
@@ -815,7 +921,7 @@ def train(args: argparse.Namespace) -> None:
                     write_event(log, "checkpoint", epoch=state.epoch, batch=state.batch, step=state.step)
 
             validation = _validate_and_save_best(
-                student, teacher, validation_blocks, args, student_device, teacher_device, state, metadata
+                student, teacher, validation_blocks, args, student_device, teacher_device, state, metadata, prev_rotations=prev_rotations,
             )
             training = {key: total / max(state.tokens, 1) for key, total in state.totals.items()}
             training["student_perplexity"] = _safe_perplexity(float(training.get("student_nll", float("nan"))))
